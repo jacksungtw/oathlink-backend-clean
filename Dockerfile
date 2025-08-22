@@ -1,23 +1,18 @@
-# Dockerfile — 純建置；啟動交由 railway.json
-ARG BUILD_ID
-ENV BUILD_ID=${BUILD_ID}
+# Dockerfile — Railway / Uvicorn
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/memory.db
+# 可選：供您在部署時注入識別字
+ARG BUILD_ID
+ENV BUILD_ID=${BUILD_ID}
 
+# 基本環境
 WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt /app/requirements.txt
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py storage.py /app/
+# 程式
+COPY . .
 
-# SQLite 實體資料夾由 Railway Disk 掛載至 /data
+# Railway 會注入 $PORT；若本機測試就走 8080
 EXPOSE 8080
-# 啟動指令改由 railway.json 的 startCommand 控制
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${PORT:-8080}"]
