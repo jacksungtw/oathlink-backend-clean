@@ -1,4 +1,5 @@
 # app.py — OathLink Backend (MVP 完成版)
+import unicodedata
 import os, time, json, uuid, sqlite3, pathlib
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -47,31 +48,49 @@ def _write_memory(content: str, tags: Optional[List[str]]) -> str:
         )
     return mid
 
-def _search_memory(q: str, top_k: int) -> List[Dict[str, Any]]:
     q = (q or "").strip()
     if not q:
         return []
-    like = f"%{q}%"
+
+    nq = _norm(q)
+    hits: List[Dict[str, Any]] = []
+
+    # 先抓最近 500 筆（避免全表掃描過大；MVP 足夠）
     with _conn() as con:
         rows = con.execute(
             """
             SELECT id, content, tags, ts
             FROM memory
-            WHERE content LIKE ? OR COALESCE(tags,'') LIKE ?
             ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (like, like, int(top_k)),
+            LIMIT 500
+            """
         ).fetchall()
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        try:
-            tags = json.loads(r["tags"]) if r["tags"] else []
-        except Exception:
-            tags = (r["tags"] or "").split(",")
-        out.append({"id": r["id"], "content": r["content"], "tags": tags, "ts": r["ts"]})
-    return out
 
+    for r in rows:
+        content = r["content"] or ""
+        try:
+            tag_list = json.loads(r["tags"]) if r["tags"] else []
+            if not isinstance(tag_list, list):
+                tag_list = [str(tag_list)]
+        except Exception:
+            tag_list = [(r["tags"] or "")]
+        tag_list = [str(t) for t in tag_list]
+
+        # 做 Unicode 正規化後再比對（支援中文、全半形、大小寫）
+        content_n = _norm(content)
+        tags_n = " ".join(_norm(t) for t in tag_list)
+
+        if (nq in content_n) or (nq in tags_n):
+            hits.append({
+                "id": r["id"],
+                "content": content,
+                "tags": tag_list,
+                "ts": r["ts"],
+            })
+            if len(hits) >= top_k:
+                break
+
+    return hits
 # ===== Auth =====
 def _check_auth(x_auth_token: Optional[str]):
     if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
