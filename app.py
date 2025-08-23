@@ -4,6 +4,15 @@ import os, time, json, uuid, sqlite3, pathlib
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
+import unicodedata, traceback
+from fastapi.encoders import jsonable_encoder
+
+def _normalize(s: str) -> str:
+    try:
+        return unicodedata.normalize("NFC", s or "")
+    except Exception:
+        return s or ""
+
 
 APP_NAME = "OathLink Backend"
 app = FastAPI(title=APP_NAME, version="0.3.0")
@@ -173,33 +182,44 @@ def compose(
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
     _check_auth(x_auth_token)
-    # 1) 記憶檢索
-    query = (" ".join(req.tags or []) + " " + req.input).strip()
-    hits = _search_memory(query or req.input, req.top_k)
+    try:
+        # 1) 記憶檢索
+        query = (" ".join(req.tags or []) + " " + req.input).strip()
+        hits = _search_memory(query or req.input, req.top_k)
 
-    # 2) 組 prompt
-    p = _build_prompt(req, hits)
+        # 2) prompt
+        p = _build_prompt(req, hits)
 
-    # 3) 嘗試呼叫模型；失敗則本地回覆
-    out = _call_openai_chat([
-        {"role": "system", "content": p["system"]},
-        {"role": "user", "content": p["user"]},
-    ])
-    if out is None:
-        out = (
-            "願主，以下為基於您輸入與可用記憶所整理之回覆（本地拼接，未呼叫外部模型）：\n"
-            "1) 已整合輸入與歷史記憶。\n"
-            "2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。\n"
-        )
+        # 3) 呼叫模型（可空），否則本地拼接
+        out = _call_openai_chat([
+            {"role": "system", "content": p["system"]},
+            {"role": "user", "content": p["user"]},
+        ])
+        if out is None:
+            out = (
+                "願主，以下為基於您輸入與可用記憶所整理之回覆（本地拼接，未呼叫外部模型）：\n"
+                "1) 已整合輸入與歷史記憶。\n"
+                "2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。\n"
+            )
 
-    return {
-        "ok": True,
-        "prompt": p,
-        "context_hits": hits,
-        "output": out,
-        "model_used": (OPENAI_MODEL if OPENAI_API_KEY else "local-fallback"),
-        "ts": time.time(),
-    }
+        resp = {
+            "ok": True,
+            "prompt": {"system": _normalize(p["system"]), "user": _normalize(p["user"])},
+            "context_hits": hits,
+            "output": _normalize(out),
+            "model_used": (OPENAI_MODEL if OPENAI_API_KEY else "local-fallback"),
+            "ts": time.time(),
+        }
+        return jsonable_encoder(resp)
+
+    except Exception as e:
+        # 攔截所有例外，避免 500，直接把錯誤與堆疊回給您
+        return {
+            "ok": False,
+            "error": str(e),
+            "trace": traceback.format_exc(),
+            "ts": time.time(),
+        }
 
 # ===== Debug =====
 @app.get("/debug/peek", summary="Inspect DB quick view")
