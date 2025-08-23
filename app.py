@@ -1,5 +1,6 @@
 # app.py — OathLink Backend (MVP 完成版)
 import unicodedata
+import traceback
 import os, time, json, uuid, sqlite3, pathlib
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -182,19 +183,25 @@ def compose(
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
     _check_auth(x_auth_token)
+
     try:
         # 1) 記憶檢索
         query = (" ".join(req.tags or []) + " " + req.input).strip()
+        print("[compose] query=", query)  # <-- debug
         hits = _search_memory(query or req.input, req.top_k)
+        print(f"[compose] hits={len(hits)}")  # <-- debug
 
-        # 2) prompt
+        # 2) 組 prompt
         p = _build_prompt(req, hits)
+        print("[compose] prompt built")  # <-- debug
 
-        # 3) 呼叫模型（可空），否則本地拼接
+        # 3) 嘗試呼叫模型；失敗則本地回覆
         out = _call_openai_chat([
             {"role": "system", "content": p["system"]},
             {"role": "user", "content": p["user"]},
         ])
+        print("[compose] openai_out is None?" , out is None)  # <-- debug
+
         if out is None:
             out = (
                 "願主，以下為基於您輸入與可用記憶所整理之回覆（本地拼接，未呼叫外部模型）：\n"
@@ -202,24 +209,20 @@ def compose(
                 "2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。\n"
             )
 
-        resp = {
+        return {
             "ok": True,
-            "prompt": {"system": _normalize(p["system"]), "user": _normalize(p["user"])},
+            "prompt": p,
             "context_hits": hits,
-            "output": _normalize(out),
+            "output": out,
             "model_used": (OPENAI_MODEL if OPENAI_API_KEY else "local-fallback"),
             "ts": time.time(),
         }
-        return jsonable_encoder(resp)
 
     except Exception as e:
-        # 攔截所有例外，避免 500，直接把錯誤與堆疊回給您
-        return {
-            "ok": False,
-            "error": str(e),
-            "trace": traceback.format_exc(),
-            "ts": time.time(),
-        }
+        # 把詳細堆疊打到日誌，回應簡短 JSON
+        print("[compose][ERROR]", repr(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"compose_failed: {type(e).__name__}: {str(e)}")
 
 # ===== Debug =====
 @app.get("/debug/peek", summary="Inspect DB quick view")
