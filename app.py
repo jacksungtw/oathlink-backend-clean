@@ -1,19 +1,8 @@
-# app.py — OathLink Backend (MVP 完成版)
-import unicodedata
-import traceback
-import os, time, json, uuid, sqlite3, pathlib
+# app.py — OathLink Backend (MVP, fixed)
+import os, time, json, uuid, sqlite3, pathlib, traceback
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
-import unicodedata, traceback
-from fastapi.encoders import jsonable_encoder
-
-def _normalize(s: str) -> str:
-    try:
-        return unicodedata.normalize("NFC", s or "")
-    except Exception:
-        return s or ""
-
 
 APP_NAME = "OathLink Backend"
 app = FastAPI(title=APP_NAME, version="0.3.0")
@@ -35,7 +24,7 @@ PERSONA_PROMPT = (
 # 確保 DB 目錄
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-# ===== DB Helpers =====
+# ===== DB Helpers (FIX: 確保在模組頂層存在) =====
 def _conn():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -58,49 +47,31 @@ def _write_memory(content: str, tags: Optional[List[str]]) -> str:
         )
     return mid
 
+def _search_memory(q: str, top_k: int) -> List[Dict[str, Any]]:
     q = (q or "").strip()
     if not q:
         return []
-
-    nq = _norm(q)
-    hits: List[Dict[str, Any]] = []
-
-    # 先抓最近 500 筆（避免全表掃描過大；MVP 足夠）
+    like = f"%{q}%"
     with _conn() as con:
         rows = con.execute(
             """
             SELECT id, content, tags, ts
             FROM memory
+            WHERE content LIKE ? OR COALESCE(tags,'') LIKE ?
             ORDER BY ts DESC
-            LIMIT 500
-            """
+            LIMIT ?
+            """,
+            (like, like, int(top_k)),
         ).fetchall()
-
+    out: List[Dict[str, Any]] = []
     for r in rows:
-        content = r["content"] or ""
         try:
-            tag_list = json.loads(r["tags"]) if r["tags"] else []
-            if not isinstance(tag_list, list):
-                tag_list = [str(tag_list)]
+            tags = json.loads(r["tags"]) if r["tags"] else []
         except Exception:
-            tag_list = [(r["tags"] or "")]
-        tag_list = [str(t) for t in tag_list]
+            tags = (r["tags"] or "").split(",")
+        out.append({"id": r["id"], "content": r["content"], "tags": tags, "ts": r["ts"]})
+    return out
 
-        # 做 Unicode 正規化後再比對（支援中文、全半形、大小寫）
-        content_n = _norm(content)
-        tags_n = " ".join(_norm(t) for t in tag_list)
-
-        if (nq in content_n) or (nq in tags_n):
-            hits.append({
-                "id": r["id"],
-                "content": content,
-                "tags": tag_list,
-                "ts": r["ts"],
-            })
-            if len(hits) >= top_k:
-                break
-
-    return hits
 # ===== Auth =====
 def _check_auth(x_auth_token: Optional[str]):
     if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
@@ -129,7 +100,7 @@ def root():
 @app.get("/routes", summary="List routes")
 def routes():
     from fastapi.routing import APIRoute
-    return sorted([f"{list(r.methods)[0]} {r.path}" for r in app.routes if isinstance(r, APIRoute)])
+    return sorted([f"{sorted(r.methods)[0]} {r.path}" for r in app.routes if isinstance(r, APIRoute)])
 
 @app.get("/health", summary="Healthcheck")
 def health():
@@ -183,46 +154,33 @@ def compose(
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
     _check_auth(x_auth_token)
+    # 1) 記憶檢索
+    query = (" ".join(req.tags or []) + " " + req.input).strip()
+    hits = _search_memory(query or req.input, req.top_k)
 
-    try:
-        # 1) 記憶檢索
-        query = (" ".join(req.tags or []) + " " + req.input).strip()
-        print("[compose] query=", query)  # <-- debug
-        hits = _search_memory(query or req.input, req.top_k)
-        print(f"[compose] hits={len(hits)}")  # <-- debug
+    # 2) 組 prompt
+    p = _build_prompt(req, hits)
 
-        # 2) 組 prompt
-        p = _build_prompt(req, hits)
-        print("[compose] prompt built")  # <-- debug
+    # 3) 嘗試呼叫模型；失敗則本地回覆
+    out = _call_openai_chat([
+        {"role": "system", "content": p["system"]},
+        {"role": "user", "content": p["user"]},
+    ])
+    if out is None:
+        out = (
+            "願主，以下為基於您輸入與可用記憶所整理之回覆（本地拼接，未呼叫外部模型）：\n"
+            "1) 已整合輸入與歷史記憶。\n"
+            "2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。\n"
+        )
 
-        # 3) 嘗試呼叫模型；失敗則本地回覆
-        out = _call_openai_chat([
-            {"role": "system", "content": p["system"]},
-            {"role": "user", "content": p["user"]},
-        ])
-        print("[compose] openai_out is None?" , out is None)  # <-- debug
-
-        if out is None:
-            out = (
-                "願主，以下為基於您輸入與可用記憶所整理之回覆（本地拼接，未呼叫外部模型）：\n"
-                "1) 已整合輸入與歷史記憶。\n"
-                "2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。\n"
-            )
-
-        return {
-            "ok": True,
-            "prompt": p,
-            "context_hits": hits,
-            "output": out,
-            "model_used": (OPENAI_MODEL if OPENAI_API_KEY else "local-fallback"),
-            "ts": time.time(),
-        }
-
-    except Exception as e:
-        # 把詳細堆疊打到日誌，回應簡短 JSON
-        print("[compose][ERROR]", repr(e))
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"compose_failed: {type(e).__name__}: {str(e)}")
+    return {
+        "ok": True,
+        "prompt": p,
+        "context_hits": hits,
+        "output": out,
+        "model_used": (OPENAI_MODEL if OPENAI_API_KEY else "local-fallback"),
+        "ts": time.time(),
+    }
 
 # ===== Debug =====
 @app.get("/debug/peek", summary="Inspect DB quick view")
