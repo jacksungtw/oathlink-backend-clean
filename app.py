@@ -3,9 +3,16 @@ import os, time, json, uuid, sqlite3, pathlib, traceback
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
+import json
+from fastapi.responses import JSONResponse
 
 APP_NAME = "OathLink Backend"
-app = FastAPI(title=APP_NAME, version="0.3.0")
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+    def render(self, content) -> bytes:
+        # 確保不逃脫中文，並用 UTF-8 編碼
+        return json.dumps(content, ensure_ascii=False).encode("utf-8")
+app = FastAPI(title=APP_NAME, version="0.3.0", default_response_class=UTF8JSONResponse)
 # --- UTF-8 Middleware ---
 @app.middleware("http")
 async def force_utf8_json(request, call_next):
