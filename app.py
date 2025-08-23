@@ -1,27 +1,12 @@
-# app.py — OathLink Backend (MVP, fixed)
-import os, time, json, uuid, sqlite3, pathlib, traceback
+# app.py — OathLink Backend (Clean 修正版)
+import os, time, json, uuid, sqlite3, pathlib, unicodedata, re
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
-import json
-from fastapi.responses import JSONResponse
 
 APP_NAME = "OathLink Backend"
-class UTF8JSONResponse(JSONResponse):
-    media_type = "application/json; charset=utf-8"
-    def render(self, content) -> bytes:
-        # 確保不逃脫中文，並用 UTF-8 編碼
-        return json.dumps(content, ensure_ascii=False).encode("utf-8")
-app = FastAPI(title=APP_NAME, version="0.3.0", default_response_class=UTF8JSONResponse)
-# --- UTF-8 Middleware ---
-@app.middleware("http")
-async def force_utf8_json(request, call_next):
-    resp = await call_next(request)
-    ctype = resp.headers.get("content-type", "")
-    if ctype and ctype.startswith("application/json") and "charset=" not in ctype.lower():
-        resp.headers["content-type"] = "application/json; charset=utf-8"
-    return resp
-# --- end ---
+app = FastAPI(title=APP_NAME, version="0.3.0")
+
 # ===== Config =====
 DB_PATH        = os.getenv("DB_PATH", "/app/data/memory.db")
 AUTH_TOKEN     = os.getenv("AUTH_TOKEN")                     # 若設定才要求驗證
@@ -39,7 +24,7 @@ PERSONA_PROMPT = (
 # 確保 DB 目錄
 pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-# ===== DB Helpers (FIX: 確保在模組頂層存在) =====
+# ===== DB Helpers =====
 def _conn():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -62,29 +47,55 @@ def _write_memory(content: str, tags: Optional[List[str]]) -> str:
         )
     return mid
 
+def _norm(s: str) -> str:
+    if s is None:
+        return ""
+    return unicodedata.normalize("NFKC", s).strip().lower()
+
 def _search_memory(q: str, top_k: int) -> List[Dict[str, Any]]:
-    q = (q or "").strip()
+    """
+    支援多關鍵字（空白分詞）AND 查詢；對 content / tags(JSON字串) 小寫化後做 LIKE。
+    """
+    q = _norm(q)
     if not q:
         return []
-    like = f"%{q}%"
+
+    terms = [t for t in re.split(r"\s+", q) if t]
+    if not terms:
+        return []
+
+    clause_parts = []
+    params: List[str] = []
+    for t in terms:
+        like = f"%{t}%"
+        clause_parts.append("(LOWER(content) LIKE ? OR LOWER(COALESCE(tags,'')) LIKE ?)")
+        params.extend([like, like])
+
+    where_sql = " AND ".join(clause_parts)
+
+    sql = f"""
+        SELECT id, content, tags, ts
+        FROM memory
+        WHERE {where_sql}
+        ORDER BY ts DESC
+        LIMIT ?
+    """
+
     with _conn() as con:
-        rows = con.execute(
-            """
-            SELECT id, content, tags, ts
-            FROM memory
-            WHERE content LIKE ? OR COALESCE(tags,'') LIKE ?
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (like, like, int(top_k)),
-        ).fetchall()
+        rows = con.execute(sql, (*params, int(top_k))).fetchall()
+
     out: List[Dict[str, Any]] = []
     for r in rows:
         try:
             tags = json.loads(r["tags"]) if r["tags"] else []
         except Exception:
             tags = (r["tags"] or "").split(",")
-        out.append({"id": r["id"], "content": r["content"], "tags": tags, "ts": r["ts"]})
+        out.append({
+            "id": r["id"],
+            "content": r["content"],
+            "tags": tags,
+            "ts": r["ts"],
+        })
     return out
 
 # ===== Auth =====
@@ -115,7 +126,7 @@ def root():
 @app.get("/routes", summary="List routes")
 def routes():
     from fastapi.routing import APIRoute
-    return sorted([f"{sorted(r.methods)[0]} {r.path}" for r in app.routes if isinstance(r, APIRoute)])
+    return sorted([f"{list(r.methods)[0]} {r.path}" for r in app.routes if isinstance(r, APIRoute)])
 
 @app.get("/health", summary="Healthcheck")
 def health():
@@ -169,14 +180,10 @@ def compose(
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
     _check_auth(x_auth_token)
-    # 1) 記憶檢索
     query = (" ".join(req.tags or []) + " " + req.input).strip()
     hits = _search_memory(query or req.input, req.top_k)
-
-    # 2) 組 prompt
     p = _build_prompt(req, hits)
 
-    # 3) 嘗試呼叫模型；失敗則本地回覆
     out = _call_openai_chat([
         {"role": "system", "content": p["system"]},
         {"role": "user", "content": p["user"]},
