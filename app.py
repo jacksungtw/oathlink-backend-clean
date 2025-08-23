@@ -6,7 +6,15 @@ from pydantic import BaseModel
 
 APP_NAME = "OathLink Backend"
 app = FastAPI(title=APP_NAME, version="0.3.0")
-
+# --- UTF-8 Middleware ---
+@app.middleware("http")
+async def force_utf8_json(request, call_next):
+    resp = await call_next(request)
+    ctype = resp.headers.get("content-type", "")
+    if ctype and ctype.startswith("application/json") and "charset=" not in ctype.lower():
+        resp.headers["content-type"] = "application/json; charset=utf-8"
+    return resp
+# --- end ---
 # ===== Config =====
 DB_PATH        = os.getenv("DB_PATH", "/app/data/memory.db")
 AUTH_TOKEN     = os.getenv("AUTH_TOKEN")                     # 若設定才要求驗證
