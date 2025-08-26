@@ -3,7 +3,16 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Header, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+# app.py 開頭加：
+from fastapi.middleware.cors import CORSMiddleware
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # 開發先用 *，上線可改成您的前端網域
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 APP_VERSION   = "0.4.0"
 AUTH_TOKEN    = os.getenv("X_AUTH_TOKEN") or os.getenv("AUTH_TOKEN") or ""
 DB_PATH       = os.getenv("DB_PATH", "data/oathlink.db")
