@@ -6,13 +6,23 @@ from pydantic import BaseModel, Field
 # app.py 開頭加：
 from fastapi.middleware.cors import CORSMiddleware
 
+# —— CORS：務必在註冊任何路由之前加上（含預檢設定）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # 開發先用 *，上線可改成您的前端網域
+    allow_origins=["*"],              # 開發期先放開，正式可改成您的前端域名
+    allow_origin_regex=".*",          # 搭配 *，確保所有來源
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],              # 需要讓 OPTIONS 自動通過
+    allow_headers=["*"],              # 需要讓自定義標頭（如 X-Auth-Token）通過
+    expose_headers=["*"],
+    max_age=86400
 )
+
+# —— 保險：通用 OPTIONS（某些環境下預檢仍會被路由層擋，這個保證 204）
+@app.options("/{rest_of_path:path}")
+def preflight(rest_of_path: str):
+    return Response(status_code=204)
+    
 APP_VERSION   = "0.4.0"
 AUTH_TOKEN    = os.getenv("X_AUTH_TOKEN") or os.getenv("AUTH_TOKEN") or ""
 DB_PATH       = os.getenv("DB_PATH", "data/oathlink.db")
