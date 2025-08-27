@@ -5,24 +5,33 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 # app.py 開頭加：
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request, Response
 
 # —— CORS：務必在註冊任何路由之前加上（含預檢設定）
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],              # 開發期先放開，正式可改成您的前端域名
-    allow_origin_regex=".*",          # 搭配 *，確保所有來源
-    allow_credentials=True,
-    allow_methods=["*"],              # 需要讓 OPTIONS 自動通過
-    allow_headers=["*"],              # 需要讓自定義標頭（如 X-Auth-Token）通過
-    expose_headers=["*"],
-    max_age=86400
-)
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    # 預檢直接回
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers", "*"),
+                "Access-Control-Allow-Methods": request.headers.get("Access-Control-Request-Method", "*"),
+            },
+        )
+    # 其他請求正常走，再補 CORS 標頭
+    resp = await call_next(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "*"
+    return resp
 
 # —— 保險：通用 OPTIONS（某些環境下預檢仍會被路由層擋，這個保證 204）
 @app.options("/{rest_of_path:path}")
 def preflight(rest_of_path: str):
     return Response(status_code=204)
-    
+
 APP_VERSION   = "0.4.0"
 AUTH_TOKEN    = os.getenv("X_AUTH_TOKEN") or os.getenv("AUTH_TOKEN") or ""
 DB_PATH       = os.getenv("DB_PATH", "data/oathlink.db")
