@@ -11,70 +11,46 @@ from fastapi import Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request, Response, APIRouter
 
-# 1) 官方 CORS 中介層（先全開，之後再收斂 allow_origins）
+# --- CORS 啟用區（置於 import 後、app = FastAPI(...) 之後，且在任何 @app.get/@app.post 之前）---
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request
+from starlette.responses import Response
+
+# 1) 正式 CORS 中介層
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],                 # 上線可改白名單，如 ["http://localhost:8501", "https://your-ui.example"]
+    allow_origins=["*"],                                # 上線可改成您的前端域名
     allow_credentials=True,
-    allow_methods=["*"],                 # 或列舉 ["GET","POST","OPTIONS"]
-    allow_headers=["*"],                 # 確保含 X-Auth-Token
+    allow_methods=["*"],                                # 或精準列舉: ["GET","POST","OPTIONS"]
+    allow_headers=["*"],                                # 或精準列舉: ["Content-Type","X-Auth-Token"]
+    expose_headers=["*"],
+    max_age=86400,
 )
 
-# 2) 額外保險：手動處理預檢 + 統一補 CORS 標頭
+# 2) 保底：所有回應都補上 CORS 標頭（防止代理或中介層吃掉）
 @app.middleware("http")
-async def _force_cors(request: Request, call_next):
-    if request.method == "OPTIONS":
-        return Response(
-            status_code=204,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers", "*"),
-                "Access-Control-Allow-Methods": request.headers.get("Access-Control-Request-Method", "*") or "*",
-            },
-        )
+async def add_cors_headers(request: Request, call_next):
     resp = await call_next(request)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "*"
+    h = resp.headers
+    h.setdefault("Access-Control-Allow-Origin", "*")
+    h.setdefault("Access-Control-Allow-Credentials", "true")
+    h.setdefault("Vary", "Origin")
     return resp
 
-# 3) 顯性宣告各路徑的 OPTIONS（部分環境/Proxy 需要）
-_options = APIRouter()
-
-@_options.options("/compose")
-async def _options_compose():
-    return Response(status_code=204, headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "*",
-        "Access-Control-Allow-Headers": "*",
-    })
-
-@_options.options("/memory/write")
-async def _options_mw():
-    return Response(status_code=204, headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "*",
-        "Access-Control-Allow-Headers": "*",
-    })
-
-@_options.options("/memory/search")
-async def _options_ms():
-    return Response(status_code=204, headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "*",
-        "Access-Control-Allow-Headers": "*",
-    })
-
-@_options.options("/health")
-async def _options_health():
-    return Response(status_code=204, headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "*",
-        "Access-Control-Allow-Headers": "*",
-    })
-
-app.include_router(_options)
-# --- CORS 強制版 結束 ---
+# 3) 保底：萬用 OPTIONS（預檢）處理器，任何路徑都回 204 並帶完整 CORS 標頭
+@app.options("/{rest_of_path:path}")
+def preflight_handler(rest_of_path: str):
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+            "Access-Control-Allow-Headers": "*, Authorization, Content-Type, X-Auth-Token",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+# --- CORS 區結束 ---
     resp = await call_next(request)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "*"
