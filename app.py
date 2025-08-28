@@ -12,36 +12,83 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-APP_NAME = "OathLink Backend"
-app = FastAPI(title=APP_NAME, version="0.x")
+APP_TITLE = "OathLink Backend"
+APP_VERSION = "0.4.0"
 
-# 1) 中介層：含 OPTIONS、所有常用標頭
+app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+
+# === 全域 CORS（務必在路由前）===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 開發先放寬；上線可改白名單（例: "https://your-ui.example"）
+    allow_origins=["*"],                     # 開發先用 *；上線可收斂到 http://localhost:8501 或您的網域
     allow_credentials=True,
-    allow_methods=["*"],   # 一定要涵蓋 OPTIONS
-    allow_headers=["*"],   # 或精準列出: ["Content-Type", "X-Auth-Token"]
+    allow_methods=["*"],                     # 一次打開，確保 OPTIONS 被接受
+    allow_headers=["*"],                     # 含 Content-Type, X-Auth-Token 等
 )
 
-# 2) 額外保險：顯式處理所有 OPTIONS，避免 405
-@app.options("/{full_path:path}")
-async def _cors_preflight_ok(full_path: str):
-    return JSONResponse(
-        status_code=200,
-        content={},
+# 額外保險：顯式處理所有路由的 OPTIONS（避免 405）
+@app.options("/{full_path:path}", include_in_schema=False)
+async def options_catch_all(full_path: str) -> Response:
+    return Response(
+        status_code=204,                     # 或 200 皆可
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, X-Auth-Token",
+            "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+            "Access-Control-Allow-Headers": "*",
         },
     )
-# --- CORS 區塊結束 ---
 
-# —— 保險：通用 OPTIONS（某些環境下預檢仍會被路由層擋，這個保證 204）
-@app.options("/{rest_of_path:path}")
-def preflight(rest_of_path: str):
-    return Response(status_code=204)
+# ---- 範例：根路徑 /、健康檢查 /health、列路由 /routes ----
+@app.get("/", summary="Root")
+async def root():
+    return {
+        "ok": True,
+        "service": APP_TITLE,
+        "version": APP_VERSION,
+        "paths": ["/health", "/compose", "/routes"],
+        "ts": time.time(),
+    }
+
+@app.get("/health", summary="Healthcheck")
+async def health():
+    # 若擔心代理吃標頭，也可顯式加上 ACAO
+    r = JSONResponse({"ok": True, "ts": time.time()})
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
+
+@app.get("/routes", summary="List routes")
+async def routes():
+    return {"ok": True, "routes": [r.path for r in app.routes], "ts": time.time()}
+
+# ---- 需要 Token 的簡化 compose 範例（保持與現有介面一致）----
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
+
+@app.post("/compose", summary="Compose with persona + memory")
+async def compose(payload: Dict[str, Any] = Body(...), request: Request = None):
+    # 簡易 Token 驗證（與您現有一致）
+    token = request.headers.get("X-Auth-Token", "")
+    if AUTH_TOKEN and token != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    input_text = str(payload.get("input", "")).strip()
+    tags = payload.get("tags") or []
+    top_k = int(payload.get("top_k") or 5)
+
+    out = {
+        "ok": True,
+        "prompt": {"system": "固定人格省略", "user": input_text},
+        "context_hits": [],
+        "output": "（示例輸出）",
+        "model_used": "gpt-4o-mini",
+        "search_mode": os.getenv("SEARCH_MODE", "fts"),
+        "ts": time.time(),
+    }
+    # 顯式加 CORS 標頭（再上一層保險）
+    r = JSONResponse(out)
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    r.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    r.headers["Access-Control-Allow-Headers"] = "*"
+    return r
 
 APP_VERSION   = "0.4.0"
 AUTH_TOKEN    = os.getenv("X_AUTH_TOKEN") or os.getenv("AUTH_TOKEN") or ""
