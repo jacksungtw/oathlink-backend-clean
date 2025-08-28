@@ -7,55 +7,36 @@ from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Request, Response
 
-# --- CORS 強制版（貼上即可） ---
+# --- CORS 啟用：務必置於所有路由之前 ---
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Request, Response, APIRouter
+from fastapi.responses import JSONResponse
 
-# --- CORS 啟用區（置於 import 後、app = FastAPI(...) 之後，且在任何 @app.get/@app.post 之前）---
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Request
-from starlette.responses import Response
+APP_NAME = "OathLink Backend"
+app = FastAPI(title=APP_NAME, version="0.x")
 
-# 1) 正式 CORS 中介層
+# 1) 中介層：含 OPTIONS、所有常用標頭
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],                                # 上線可改成您的前端域名
+    allow_origins=["*"],   # 開發先放寬；上線可改白名單（例: "https://your-ui.example"）
     allow_credentials=True,
-    allow_methods=["*"],                                # 或精準列舉: ["GET","POST","OPTIONS"]
-    allow_headers=["*"],                                # 或精準列舉: ["Content-Type","X-Auth-Token"]
-    expose_headers=["*"],
-    max_age=86400,
+    allow_methods=["*"],   # 一定要涵蓋 OPTIONS
+    allow_headers=["*"],   # 或精準列出: ["Content-Type", "X-Auth-Token"]
 )
 
-# 2) 保底：所有回應都補上 CORS 標頭（防止代理或中介層吃掉）
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    resp = await call_next(request)
-    h = resp.headers
-    h.setdefault("Access-Control-Allow-Origin", "*")
-    h.setdefault("Access-Control-Allow-Credentials", "true")
-    h.setdefault("Vary", "Origin")
-    return resp
-
-# 3) 保底：萬用 OPTIONS（預檢）處理器，任何路徑都回 204 並帶完整 CORS 標頭
-@app.options("/{rest_of_path:path}")
-def preflight_handler(rest_of_path: str):
-    return Response(
-        status_code=204,
+# 2) 額外保險：顯式處理所有 OPTIONS，避免 405
+@app.options("/{full_path:path}")
+async def _cors_preflight_ok(full_path: str):
+    return JSONResponse(
+        status_code=200,
+        content={},
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-            "Access-Control-Allow-Headers": "*, Authorization, Content-Type, X-Auth-Token",
-            "Access-Control-Max-Age": "86400",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-Auth-Token",
         },
     )
-# --- CORS 區結束 ---
-    resp = await call_next(request)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "*"
-    return resp
+# --- CORS 區塊結束 ---
 
 # —— 保險：通用 OPTIONS（某些環境下預檢仍會被路由層擋，這個保證 204）
 @app.options("/{rest_of_path:path}")
