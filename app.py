@@ -202,3 +202,113 @@ def debug_reset(x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")
     cur.execute("DELETE FROM memory")
     con.commit()
     return {"ok": True, "reset": True, "ts": _now()}
+    # ===== Bundle Schemas =====
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+
+class BundleItem(BaseModel):
+    id: Optional[str] = None
+    content: str = Field(..., min_length=1)
+    tags: List[str] = Field(default_factory=list)
+    ts: float = Field(default_factory=_now)
+
+class BundlePayload(BaseModel):
+    bundle_version: str = "1.0"
+    persona: str = "無蘊-敬語版"
+    memory: List[BundleItem] = Field(default_factory=list)
+
+# —— Helper：確保 UTF-8 正確寫入（關鍵：ensure_ascii=False）
+def _json_dumps_utf8(o) -> str:
+    return json.dumps(o, ensure_ascii=False)
+
+# ===== Bundle: Export =====
+@app.get("/bundle/export")
+def bundle_export(
+    since_ts: Optional[float] = Query(default=None),
+    limit: int = Query(default=1000, ge=1, le=10000),
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")
+):
+    _guard(x_auth_token)
+    if since_ts:
+        rows = cur.execute(
+            "SELECT id, content, tags, ts FROM memory WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+            (since_ts, limit)
+        ).fetchall()
+    else:
+        rows = cur.execute(
+            "SELECT id, content, tags, ts FROM memory ORDER BY ts DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    mem = []
+    for r in rows:
+        mem.append({
+            "id": r["id"],
+            "content": r["content"],                       # 已用 TEXT，SQLite 內建 UTF-8
+            "tags": json.loads(r["tags"] or "[]"),
+            "ts": r["ts"]
+        })
+    return {
+        "ok": True,
+        "bundle_version": "1.0",
+        "persona": "無蘊-敬語版",
+        "memory": mem,
+        "count": len(mem),
+        "ts": _now()
+    }
+
+# ===== Bundle: Import =====
+@app.post("/bundle/import")
+def bundle_import(
+    payload: BundlePayload,
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")
+):
+    _guard(x_auth_token)
+
+    imported, skipped = 0, 0
+    for item in payload.memory:
+        content = _norm(item.content)
+        if not content:
+            skipped += 1
+            continue
+        tags = [t for t in (item.tags or []) if t]
+        # 若帶 id 且已存在 → 略過避免覆蓋
+        if item.id:
+            ex = cur.execute("SELECT 1 FROM memory WHERE id = ?", (item.id,)).fetchone()
+            if ex:
+                skipped += 1
+                continue
+            mid = item.id
+        else:
+            mid = _mk_id()
+        cur.execute(
+            "INSERT INTO memory (id, content, tags, ts) VALUES (?,?,?,?)",
+            (mid, content, _json_dumps_utf8(tags), float(item.ts or _now()))
+        )
+        imported += 1
+    con.commit()
+    return {"ok": True, "imported": imported, "skipped": skipped, "ts": _now()}
+
+# ===== Bundle: Preview =====
+@app.get("/bundle/preview")
+def bundle_preview(
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")
+):
+    _guard(x_auth_token)
+    count = cur.execute("SELECT COUNT(*) c FROM memory").fetchone()["c"]
+    sample = cur.execute(
+        "SELECT content, tags, ts FROM memory ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    sample_obj = []
+    if sample:
+        sample_obj.append({
+            "content": sample["content"],
+            "tags": json.loads(sample["tags"] or "[]"),
+            "ts": sample["ts"]
+        })
+    return {
+        "ok": True,
+        "persona": "無蘊-敬語版",
+        "count_memory": count,
+        "latest_ts": sample["ts"] if sample else None,
+        "sample": sample_obj
+    }
