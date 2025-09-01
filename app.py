@@ -143,58 +143,56 @@ def routes():
     return {"ok": True, "routes": [r.path for r in app.router.routes], "ts": _now()}
 
 @app.post("/memory/write")
-def memory_write(req: MemoryWriteReq, x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
+def memory_write(req: MemoryWriteReq, x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
     _guard(x_auth_token)
-    mid = _write_memory(req.content, req.tags)
-    return {"ok": True, "id": mid}
+    mid = _write_memory(_norm(req.content), req.tags)  # _write_memory 內部不要 encode/decode
+    return _json_utf8({"ok": True, "id": mid})
 
 @app.get("/memory/search")
 def memory_search(q: str = Query(..., min_length=1), top_k: int = Query(5, ge=1, le=100),
-                  x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
+                  x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
     _guard(x_auth_token)
     hits = _search_memory(q, top_k)
-    return {"ok": True, "results": hits, "ts": _now()}
+    return _json_utf8({"ok": True, "results": hits, "ts": _now()})
 
 @app.post("/compose")
-async def compose(req: ComposeReq, x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
+def compose(req: ComposeReq, x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
     _guard(x_auth_token)
     q = req.input.strip()
     hits = _search_memory(q, req.top_k)
 
     system_prompt = "您是『OathLink 穩定語風人格助手（無蘊）』。規範：稱使用者為願主/師父/您；回覆簡明、可執行、條列步驟；不說空話；必要時先標註風險與前置條件。"
-    user_prompt   = f"【輸入】\n{q}\n\n【可用記憶】\n" + ("\n".join(f"- {h['content']}" for h in hits) if hits else "（無匹配記憶）") + "\n\n請以固定語風輸出最終回覆。"
+    user_prompt = f"【輸入】\n{req.input}\n\n【可用記憶】\n" + (
+        "\n".join(f"- {h['content']}" for h in hits) if hits else "（無匹配記憶）"
+    ) + "\n\n請以固定語風輸出最終回覆。"
 
     output = (
         f"願主，以下為基於您輸入與可用記憶所整理之回覆：\n"
-        f"1) 已整合輸入：{q}\n"
+        f"1) 已整合輸入：{req.input}\n"
         f"2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。"
     )
 
-    return JSONResponse(
-        content={
-            "ok": True,
-            "prompt": {"system": system_prompt, "user": user_prompt},
-            "context_hits": hits,
-            "output": output,
-            "model_used": "gpt-4o-mini",
-            "search_mode": SEARCH_MODE,
-            "ts": _now(),
-        },
-        media_type="application/json; charset=utf-8"
-    )
-
-@app.get("/debug/peek")
-def debug_peek(x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    rows = cur.execute("SELECT * FROM memory ORDER BY ts DESC LIMIT 50").fetchall()
-    return {
+    return _json_utf8({
         "ok": True,
-        "rows": [
-            {"id": r["id"], "content": r["content"], "tags": json.loads(r["tags"] or "[]"), "ts": r["ts"]}
-            for r in rows
-        ],
-        "ts": _now()
-    }
+        "prompt": {"system": system_prompt, "user": user_prompt},
+        "context_hits": hits,
+        "output": output,
+        "model_used": "gpt-4o-mini",
+        "search_mode": SEARCH_MODE,
+        "ts": _now(),
+    })
+@app.get("/debug/peek")
+def debug_peek():
+    rows = cur.execute("SELECT * FROM memory ORDER BY ts DESC LIMIT 50").fetchall()
+    items = []
+    for r in rows:
+        items.append({
+            "id": r["id"],
+            "content": r["content"],  # 不要 encode/decode
+            "tags": json.loads(r["tags"] or "[]"),
+            "ts": r["ts"]
+        })
+    return _json_utf8({"ok": True, "rows": items, "ts": _now()})
 
 @app.post("/debug/reset")
 def debug_reset(x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
