@@ -205,6 +205,21 @@ def debug_reset(x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")
     cur.execute("DELETE FROM memory")
     con.commit()
     return {"ok": True, "reset": True, "ts": _now()}
+ from fastapi import Request
+
+@app.post("/debug/echo", summary="回顯原始請求以檢查編碼")
+async def debug_echo(req: Request):
+    raw = await req.body()  # 原始 bytes
+    try:
+        parsed = await req.json()
+    except Exception:
+        parsed = None
+    return _json_utf8({
+        "raw_len": len(raw),
+        "raw_first_24_bytes": list(raw[:24]),
+        "as_text_utf8": raw.decode("utf-8", errors="replace"),
+        "parsed": parsed,
+    })  
     # ===== Bundle Schemas =====
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
