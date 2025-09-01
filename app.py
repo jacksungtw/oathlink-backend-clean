@@ -169,10 +169,9 @@ def compose(req: ComposeReq, x_auth_token: Optional[str] = Header(default=None, 
     hits = _search_memory(req.input.strip(), req.top_k)
 
     system_prompt = "您是『OathLink 穩定語風人格助手（無蘊）』。規範：稱使用者為願主/師父/您；回覆簡明、可執行、條列步驟；不說空話；必要時先標註風險與前置條件。"
-    user_prompt = "【輸入】\n" + req.input + "\n\n【可用記憶】\n" + (
-        "\n".join(f"- {h['content']}" for h in hits) if hits else "（無匹配記憶）"
+    user_prompt = f"【輸入】\n{req.input}\n\n【可用記憶】\n" + (
+    "\n".join(f"- {h['content']}" for h in hits) if hits else "（無匹配記憶）"
     ) + "\n\n請以固定語風輸出最終回覆。"
-
     output = (
         f"願主，以下為基於您輸入與可用記憶所整理之回覆：\n"
         f"1) 已整合輸入：{req.input}\n"
