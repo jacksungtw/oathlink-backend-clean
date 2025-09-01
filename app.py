@@ -4,7 +4,15 @@ from fastapi import FastAPI, Header, HTTPException, Body, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+# app.py
+import json
+from fastapi.responses import Response
 
+def _json_utf8(obj) -> Response:
+    return Response(
+        content=json.dumps(obj, ensure_ascii=False, separators=(",", ":")),
+        media_type="application/json; charset=utf-8",
+    )
 APP_TITLE = "OathLink Backend"
 APP_VERSION = "0.5.0"
 
@@ -158,11 +166,10 @@ def memory_search(q: str = Query(..., min_length=1), top_k: int = Query(5, ge=1,
 @app.post("/compose")
 def compose(req: ComposeReq, x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
     _guard(x_auth_token)
-    q = req.input.strip()
-    hits = _search_memory(q, req.top_k)
+    hits = _search_memory(req.input.strip(), req.top_k)
 
     system_prompt = "您是『OathLink 穩定語風人格助手（無蘊）』。規範：稱使用者為願主/師父/您；回覆簡明、可執行、條列步驟；不說空話；必要時先標註風險與前置條件。"
-    user_prompt = f"【輸入】\n{req.input}\n\n【可用記憶】\n" + (
+    user_prompt = "【輸入】\n" + req.input + "\n\n【可用記憶】\n" + (
         "\n".join(f"- {h['content']}" for h in hits) if hits else "（無匹配記憶）"
     ) + "\n\n請以固定語風輸出最終回覆。"
 
@@ -184,14 +191,12 @@ def compose(req: ComposeReq, x_auth_token: Optional[str] = Header(default=None, 
 @app.get("/debug/peek")
 def debug_peek():
     rows = cur.execute("SELECT * FROM memory ORDER BY ts DESC LIMIT 50").fetchall()
-    items = []
-    for r in rows:
-        items.append({
-            "id": r["id"],
-            "content": r["content"],  # 不要 encode/decode
-            "tags": json.loads(r["tags"] or "[]"),
-            "ts": r["ts"]
-        })
+    items = [{
+        "id": r["id"],
+        "content": r["content"],                 # 不做 encode/decode
+        "tags": json.loads(r["tags"] or "[]"),
+        "ts": r["ts"]
+    } for r in rows]
     return _json_utf8({"ok": True, "rows": items, "ts": _now()})
 
 @app.post("/debug/reset")
@@ -245,7 +250,7 @@ def bundle_export(
             "tags": json.loads(r["tags"] or "[]"),
             "ts": r["ts"]
         })
-    return {
+    return _json_utf8 (bundle) {
         "ok": True,
         "bundle_version": "1.0",
         "persona": "無蘊-敬語版",
