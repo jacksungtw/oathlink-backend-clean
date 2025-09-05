@@ -1,272 +1,198 @@
-# 建立 app.py
-@'
-import os, json, time, sqlite3, unicodedata, uuid
-from typing import Optional, Any
-from fastapi import FastAPI, Header, Request, Query, HTTPException
+# app.py
+from __future__ import annotations
+import json, os, sqlite3, time, uuid
+from typing import List, Optional
+from fastapi import FastAPI, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import Response
+from fastapi.responses import JSONResponse
 
-# -------- UTF-8 JSON Response（確保回傳永遠是 UTF-8） --------
-class UTF8JSONResponse(Response):
-    media_type = "application/json; charset=utf-8"
-    def render(self, content: Any) -> bytes:
-        return json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", "oathlink.db")
+AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "abc123")
 
-# -------- 基本設定 --------
-DB_PATH   = os.environ.get("DB_PATH", "oathlink.db")
-AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "abc123")
+app = FastAPI(title="OathLink Backend (UTF-8 fixed)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def _conn():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row           # 以欄位名讀取
+    # 不自訂 text_factory，SQLite 預設就是 UTF-8，避免亂碼來源
+    return con
 
 def _now() -> float:
-    return time.time()
+    return float(time.time())
 
-def _mk_id() -> str:
-    return str(uuid.uuid4())
-
-def _norm(s: str) -> str:
-    if s is None: return ""
-    return unicodedata.normalize("NFKC", s)
+def _json(data: dict, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        content=data,
+        status_code=status_code,
+        media_type="application/json; charset=utf-8",
+    )
 
 def _guard(x_auth_token: Optional[str]):
     if x_auth_token != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise _json({"ok": False, "error": "unauthorized"}, 401)
 
-# -------- DB 初始化（不要覆寫 text_factory；SQLite 原生支援 UTF-8） --------
-def _init_db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS memory(
-          id      TEXT PRIMARY KEY,
-          content TEXT NOT NULL,
-          tags    TEXT NOT NULL, -- JSON (ensure_ascii=False)
-          ts      REAL NOT NULL
+def _init_db():
+    con = _conn()
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            ts REAL NOT NULL
         )
     """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_memory_ts ON memory(ts DESC)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_memory_content ON memory(content)")
     con.commit()
-    return con
+    con.close()
 
-CON = _init_db()
+_init_db()
 
-# -------- App 與 CORS --------
-app = FastAPI(title="OathLink Backend (UTF-8 Clean)")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
-)
-
-# -------- 健康檢查與路由清單 --------
 @app.get("/health")
 def health():
-    return UTF8JSONResponse({"ok": True, "service":"OathLink Backend", "ts": _now()})
+    return _json({"ok": True, "service": "oathlink-backend", "ts": _now()})
 
 @app.get("/routes")
 def routes():
-    items = [{"path": r.path, "methods": sorted(list(r.methods or []))} for r in app.router.routes]
-    return UTF8JSONResponse({"ok": True, "routes": items, "ts": _now()})
-
-# -------- Debug：清庫 / 檢視 / 回顯 / 修復 Mojibake --------
-@app.post("/debug/reset")
-def debug_reset(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    CON.execute("DROP TABLE IF EXISTS memory")
-    CON.commit()
-    CON.execute("""
-        CREATE TABLE memory(
-          id      TEXT PRIMARY KEY,
-          content TEXT NOT NULL,
-          tags    TEXT NOT NULL,
-          ts      REAL NOT NULL
-        )
-    """)
-    CON.execute("CREATE INDEX IF NOT EXISTS idx_memory_ts ON memory(ts DESC)")
-    CON.execute("CREATE INDEX IF NOT EXISTS idx_memory_content ON memory(content)")
-    CON.commit()
-    return UTF8JSONResponse({"ok": True, "reset": True, "ts": _now()})
-
-@app.get("/debug/peek")
-def debug_peek(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    rows = CON.execute("SELECT id, content, tags, ts FROM memory ORDER BY ts DESC LIMIT 50").fetchall()
-    out = []
-    for r in rows:
-        try:
-            tags = json.loads(r["tags"])
-        except Exception:
-            tags = []
-        out.append({"id": r["id"], "content": r["content"], "tags": tags, "ts": r["ts"]})
-    return UTF8JSONResponse({"ok": True, "rows": out, "ts": _now()})
-
-@app.post("/debug/echo")
-async def debug_echo(request: Request, x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    raw = await request.body()
-    as_text_utf8 = raw.decode("utf-8", errors="replace")
-    try:
-        parsed = json.loads(as_text_utf8)
-    except Exception:
-        parsed = {}
-    return UTF8JSONResponse({
+    return _json({
         "ok": True,
-        "raw_first_32_bytes": list(raw[:32]),
-        "as_text_utf8": as_text_utf8,
-        "parsed": parsed,
+        "routes": [
+            "/health", "/routes",
+            "/memory/write", "/memory/search",
+            "/debug/peek", "/debug/reset",
+            "/compose"
+        ],
         "ts": _now()
     })
 
-@app.post("/debug/repair_mojibake")
-def debug_repair_mojibake(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    rows = CON.execute("SELECT id, content FROM memory").fetchall()
-    repaired = 0
-    for r in rows:
-        s = r["content"]
-        # 嘗試把「UTF-8 當 latin-1 解讀」造成的亂碼修回來
-        try:
-            fixed = s.encode("latin-1").decode("utf-8")
-            if fixed != s:
-                CON.execute("UPDATE memory SET content=? WHERE id=?", (fixed, r["id"]))
-                repaired += 1
-        except Exception:
-            pass
-    CON.commit()
-    return UTF8JSONResponse({"ok": True, "repaired": repaired, "ts": _now()})
-
-# -------- 記憶寫入 / 搜尋 --------
 @app.post("/memory/write")
-async def memory_write(request: Request, x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
+def memory_write(
+    body: dict,
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+):
     _guard(x_auth_token)
-    body = await request.json()
-    content = _norm(body.get("content", ""))
-    tags    = body.get("tags", [])
-    if not isinstance(tags, list): tags = []
-    tags = [str(t) for t in tags]
-    mid = _mk_id()
-    CON.execute(
-        "INSERT INTO memory(id, content, tags, ts) VALUES (?,?,?,?)",
-        (mid, content, json.dumps(tags, ensure_ascii=False), _now())
+    content = (body or {}).get("content", "")
+    tags: List[str] = (body or {}).get("tags", []) or []
+    mid = str(uuid.uuid4())
+
+    con = _conn()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO memory (id, content, tags, ts) VALUES (?,?,?,?)",
+        (mid, str(content), json.dumps(tags, ensure_ascii=False), _now()),
     )
-    CON.commit()
-    return UTF8JSONResponse({"ok": True, "id": mid})
+    con.commit()
+    con.close()
+    return _json({"ok": True, "id": mid})
+
+@app.get("/debug/peek")
+def debug_peek(
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+):
+    _guard(x_auth_token)
+    con = _conn()
+    rows = con.execute("SELECT id, content, tags, ts FROM memory ORDER BY ts DESC LIMIT 50").fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "content": r["content"],                       # 直接原文，避免再編碼
+            "tags": json.loads(r["tags"] or "[]"),
+            "ts": r["ts"],
+        })
+    return _json({"ok": True, "rows": out, "ts": _now()})
+
+@app.post("/debug/reset")
+def debug_reset(
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+):
+    _guard(x_auth_token)
+    con = _conn()
+    con.execute("DELETE FROM memory")
+    con.commit()
+    con.close()
+    return _json({"ok": True, "reset": True, "ts": _now()})
 
 @app.get("/memory/search")
 def memory_search(
     q: str = Query(..., min_length=1),
-    top_k: int = Query(5, ge=1, le=50),
-    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")
+    top_k: int = Query(5, ge=1, le=100),
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
 ):
     _guard(x_auth_token)
-    qn = _norm(q)
-    rows = CON.execute(
+    con = _conn()
+    # 先用簡單 LIKE（SQLite 預設 UTF-8 沒問題）；之後再換 FTS 也行
+    rows = con.execute(
         "SELECT id, content, tags, ts FROM memory WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
-        (f"%{qn}%", top_k)
+        (f"%{q}%", top_k),
     ).fetchall()
-    out = [{"id": r["id"], "content": r["content"], "tags": json.loads(r["tags"]), "ts": r["ts"]} for r in rows]
-    return UTF8JSONResponse({"ok": True, "results": out, "ts": _now()})
+    con.close()
 
-# -------- 記憶打包：匯入 / 匯出 / 預覽 --------
-@app.post("/bundle/import")
-async def bundle_import(request: Request, x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    body = await request.json()
-    persona = body.get("persona", "無蘊-敬語版")
-    mems = body.get("memory", [])
-    imported, skipped = 0, 0
-    for m in mems:
-        content = _norm(m.get("content", ""))
-        tags = m.get("tags", [])
-        ts   = float(m.get("ts", _now()))
-        exists = CON.execute("SELECT 1 FROM memory WHERE content=? AND ABS(ts-?)<1e-6", (content, ts)).fetchone()
-        if exists:
-            skipped += 1
-            continue
-        mid = _mk_id()
-        CON.execute(
-            "INSERT INTO memory(id, content, tags, ts) VALUES (?,?,?,?)",
-            (mid, content, json.dumps(tags, ensure_ascii=False), ts)
-        )
-        imported += 1
-    CON.commit()
-    return UTF8JSONResponse({"ok": True, "imported": imported, "skipped": skipped, "persona": persona, "ts": _now()})
+    hits = []
+    for r in rows:
+        hits.append({
+            "id": r["id"],
+            "content": r["content"],
+            "tags": json.loads(r["tags"] or "[]"),
+            "ts": r["ts"],
+        })
+    return _json({"ok": True, "results": hits, "ts": _now()})
 
-@app.get("/bundle/export")
-def bundle_export(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    rows = CON.execute("SELECT content, tags, ts FROM memory ORDER BY ts DESC").fetchall()
-    mem = [{"content": r["content"], "tags": json.loads(r["tags"]), "ts": r["ts"]} for r in rows]
-    return UTF8JSONResponse({
-        "ok": True,
-        "bundle_version": "1.0",
-        "persona": "無蘊-敬語版",
-        "memory": mem,
-        "count": len(mem),
-        "ts": _now()
-    })
-
-@app.get("/bundle/preview")
-def bundle_preview(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    row = CON.execute("SELECT MAX(ts) AS latest_ts, COUNT(*) AS cnt FROM memory").fetchone()
-    sample = CON.execute("SELECT content, tags, ts FROM memory ORDER BY ts DESC LIMIT 5").fetchall()
-    sample_out = [{"content": r["content"], "tags": json.loads(r["tags"]), "ts": r["ts"]} for r in sample]
-    return UTF8JSONResponse({
-        "ok": True,
-        "persona": "無蘊-敬語版",
-        "count_memory": int(row["cnt"] or 0),
-        "latest_ts": row["latest_ts"],
-        "sample": sample_out
-    })
-
-# -------- Compose（不外呼模型；本地組裝語風） --------
 @app.post("/compose")
-async def compose(request: Request, x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
+def compose(
+    body: dict,
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+):
     _guard(x_auth_token)
-    body = await request.json()
-    input_text = _norm(body.get("input", ""))
-    top_k = int(body.get("top_k", 1))
-    rows = CON.execute(
+    input_text: str = (body or {}).get("input", "") or ""
+    top_k: int = int((body or {}).get("top_k", 1) or 1)
+
+    # 取上下文
+    con = _conn()
+    rows = con.execute(
         "SELECT id, content, tags, ts FROM memory WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
-        (f"%{input_text}%", top_k)
+        (f"%{input_text}%", top_k),
     ).fetchall()
-    hits = [{"id": r["id"], "content": r["content"], "tags": json.loads(r["tags"]), "ts": r["ts"]} for r in rows]
+    con.close()
 
-    system = "您是『OathLink 穩定語風人格助手（無蘊）』。規範：稱使用者為願主/師父/您；回覆簡明、可執行、條列步驟；不說空話；必要時先標註風險與前置條件。"
-    prompt_user = "【輸入】\n" + input_text + "\n\n【可用記憶】\n" + ( "\n".join([f"- {h['content']}" for h in hits]) if hits else "（無匹配記憶）" ) + "\n\n請以固定語風輸出最終回覆。"
-    output = f"願主，以下為基於您輸入與可用記憶所整理之回覆：\n1) 已整合輸入：{input_text}\n2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。"
+    hits = [{
+        "id": r["id"],
+        "content": r["content"],
+        "tags": json.loads(r["tags"] or "[]"),
+        "ts": r["ts"],
+    } for r in rows]
 
-    return UTF8JSONResponse({
+    prompt_user = (
+        f"【輸入】\n{input_text}\n\n"
+        "【可用記憶】\n" +
+        ("\n".join(f"- {h['content']}" for h in hits) if hits else "（無匹配記憶）") +
+        "\n\n請以固定語風輸出最終回覆。"
+    )
+
+    output = (
+        "願主，以下為基於您輸入與可用記憶所整理之回覆：\n"
+        f"1) 已整合輸入：{input_text}\n"
+        "2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。"
+    )
+
+    return _json({
         "ok": True,
-        "prompt": {"system": system, "user": prompt_user},
+        "prompt": {
+            "system": "您是『OathLink 穩定語風人格助手（無蘊）』。規範：稱使用者為願主/師父/您；回覆簡明、可執行、條列步驟；不說空話；必要時先標註風險與前置條件。",
+            "user": prompt_user,
+        },
         "context_hits": hits,
         "output": output,
         "model_used": "gpt-4o-mini",
         "search_mode": "like",
-        "ts": _now()
+        "ts": _now(),
     })
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=True)
-'@ | Set-Content -Path .\app.py -Encoding UTF8
-
-# 建立 requirements.txt
-@'
-fastapi>=0.110,<1.0
-uvicorn>=0.23
-'@ | Set-Content -Path .\requirements.txt -Encoding UTF8
-
-# 建立 Procfile（給 Railway/Heroku 之類）
-@'
-web: uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
-'@ | Set-Content -Path .\Procfile -Encoding UTF8
-
-# 建立 README.md（含驗收三步）
-@'
-# OathLink Backend (UTF-8 Clean)
-
-## 本機啟動
-```bash
-pip install -r requirements.txt
-uvicorn app:app --reload
