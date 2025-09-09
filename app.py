@@ -196,4 +196,167 @@ def compose(
         "search_mode": "like",
         "ts": _now(),
     })
-    
+    # ==== bundle endpoints (add this block) ====
+import os, json, time, sqlite3, uuid
+from typing import Optional, List
+from fastapi import Request, UploadFile, File, Header, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "abc123")
+
+def _guard(x_auth_token: Optional[str]):
+    if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+DB_PATH = os.getenv("DB_PATH", "data/oathlink.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+_con = sqlite3.connect(DB_PATH, check_same_thread=False)
+_con.row_factory = sqlite3.Row
+_cur = _con.cursor()
+# memory 表 & meta 表（儲存 persona）
+_cur.execute("""
+CREATE TABLE IF NOT EXISTS memory(
+  id TEXT PRIMARY KEY,
+  content TEXT NOT NULL,
+  tags TEXT NOT NULL,
+  ts REAL NOT NULL
+)""")
+_cur.execute("""
+CREATE TABLE IF NOT EXISTS meta(
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+)""")
+_con.commit()
+
+def _now() -> float:
+    return time.time()
+
+def _mk_id() -> str:
+    return str(uuid.uuid4())
+
+def _json_utf8(data: dict) -> JSONResponse:
+    return JSONResponse(content=data, media_type="application/json; charset=utf-8")
+
+class MemItem(BaseModel):
+    content: str
+    tags: List[str] = []
+    ts: float
+
+class Bundle(BaseModel):
+    bundle_version: str = "1.0"
+    persona: Optional[str] = None
+    memory: List[MemItem] = []
+
+@app.get("/routes")
+def list_routes():
+    from fastapi.routing import APIRoute
+    items = []
+    for r in app.routes:
+        if isinstance(r, APIRoute):
+            items.append({"path": r.path, "methods": sorted(r.methods)})
+    return _json_utf8({"ok": True, "routes": items, "ts": _now()})
+
+@app.post("/bundle/import")
+async def bundle_import(
+    request: Request,
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
+    file: Optional[UploadFile] = File(default=None)
+):
+    _guard(x_auth_token)
+
+    # 1) 讀取 JSON：multipart 檔案優先，其次直接讀取 body
+    try:
+        if file is not None:
+            raw = await file.read()
+            data = json.loads(raw.decode("utf-8"))
+        else:
+            data = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    try:
+        bundle = Bundle(**data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid bundle schema: {e}")
+
+    imported = 0
+    for m in bundle.memory:
+        # 去重：相同 content+tags 視為重覆
+        tags_json = json.dumps(m.tags, ensure_ascii=False)
+        exists = _cur.execute(
+            "SELECT id FROM memory WHERE content=? AND tags=?",
+            (m.content, tags_json)
+        ).fetchone()
+        if exists:
+            continue
+        _cur.execute(
+            "INSERT INTO memory(id, content, tags, ts) VALUES(?,?,?,?)",
+            (_mk_id(), m.content, tags_json, float(m.ts))
+        )
+        imported += 1
+
+    # 保存 persona（若提供）
+    persona_saved = False
+    if bundle.persona:
+        _cur.execute("INSERT INTO meta(k, v) VALUES('persona', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (bundle.persona,))
+        persona_saved = True
+
+    _con.commit()
+    return _json_utf8({
+        "ok": True,
+        "bundle_version": bundle.bundle_version,
+        "persona_saved": persona_saved,
+        "imported": imported,
+        "skipped": len(bundle.memory) - imported,
+        "ts": _now()
+    })
+
+@app.get("/bundle/export")
+def bundle_export(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
+    _guard(x_auth_token)
+    persona_row = _cur.execute("SELECT v FROM meta WHERE k='persona'").fetchone()
+    persona = persona_row["v"] if persona_row else None
+
+    rows = _cur.execute("SELECT id, content, tags, ts FROM memory ORDER BY ts DESC").fetchall()
+    mem = []
+    for r in rows:
+        mem.append({
+            "id": r["id"],
+            "content": r["content"],
+            "tags": json.loads(r["tags"] or "[]"),
+            "ts": r["ts"]
+        })
+    return _json_utf8({
+        "ok": True,
+        "bundle_version": "1.0",
+        "persona": persona,
+        "memory": mem,
+        "count": len(mem),
+        "ts": _now()
+    })
+
+@app.get("/bundle/preview")
+def bundle_preview(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
+    _guard(x_auth_token)
+    persona_row = _cur.execute("SELECT v FROM meta WHERE k='persona'").fetchone()
+    persona = persona_row["v"] if persona_row else None
+
+    rows = _cur.execute("SELECT id, content, tags, ts FROM memory ORDER BY ts DESC LIMIT 5").fetchall()
+    sample = []
+    for r in rows:
+        sample.append({
+            "id": r["id"],
+            "content": r["content"],
+            "tags": json.loads(r["tags"] or "[]"),
+            "ts": r["ts"]
+        })
+    latest_ts = sample[0]["ts"] if sample else None
+    return _json_utf8({
+        "ok": True,
+        "persona": persona,
+        "count_memory": _cur.execute("SELECT COUNT(*) AS c FROM memory").fetchone()["c"],
+        "latest_ts": latest_ts,
+        "sample": sample
+    })
+# ==== end bundle endpoints ====
