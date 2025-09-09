@@ -196,3 +196,142 @@ def compose(
         "search_mode": "like",
         "ts": _now(),
     })
+    # ==== Bundle Import / Export / Preview ======================================
+from fastapi import File, UploadFile, Request, Header
+from typing import Optional, List, Dict, Any
+import json, time
+
+# 假設你已有這些工具函式/變數：_guard(x_auth_token), _now(), _json_utf8(),
+# 以及寫入/讀取記憶的 DB 游標 cur、連線 con、正規化 _norm 等。
+# 若名稱不同，對應改掉即可。
+
+def _insert_memory(mid: str, content: str, tags: List[str], ts: float):
+    cur.execute(
+        "INSERT INTO memory (id, content, tags, ts) VALUES (?,?,?,?)",
+        (mid, content, json.dumps(tags, ensure_ascii=False), ts)
+    )
+    con.commit()
+
+def _exists_same(content: str, tags: List[str]) -> bool:
+    row = cur.execute(
+        "SELECT id FROM memory WHERE content=? AND tags=? LIMIT 1",
+        (content, json.dumps(tags, ensure_ascii=False))
+    ).fetchone()
+    return row is not None
+
+@app.post("/bundle/import")
+async def bundle_import(
+    request: Request,
+    file: Optional[UploadFile] = File(default=None),
+    x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")
+):
+    _guard(x_auth_token)
+
+    # 1) 取得 bundle 物件
+    if file is not None:
+        raw = await file.read()
+        try:
+            bundle = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            return _json_utf8({"ok": False, "error": f"invalid_json_file: {e}", "ts": _now()})
+    else:
+        try:
+            bundle = await request.json()
+        except Exception as e:
+            return _json_utf8({"ok": False, "error": f"invalid_json_body: {e}", "ts": _now()})
+
+    # 2) 驗證基本欄位
+    bundle_version = str(bundle.get("bundle_version", "1.0"))
+    persona = str(bundle.get("persona", "")) if bundle.get("persona") is not None else ""
+    memory_list = bundle.get("memory", [])
+    if not isinstance(memory_list, list):
+        return _json_utf8({"ok": False, "error": "memory_must_be_list", "ts": _now()})
+
+    # 3) 寫入記憶（略重複去重邏輯）
+    imported = 0
+    skipped = 0
+    for item in memory_list:
+        try:
+            content = _norm(item.get("content", ""))
+            tags = item.get("tags", [])
+            ts = float(item.get("ts", _now()))
+            if not content:
+                skipped += 1
+                continue
+            if not isinstance(tags, list):
+                tags = []
+            if _exists_same(content, tags):
+                skipped += 1
+                continue
+            _insert_memory(_mk_id(), content, tags, ts)
+            imported += 1
+        except Exception:
+            skipped += 1
+
+    # 4) （選擇性）保存 persona，可放 settings 表
+    try:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        )
+        """)
+        con.commit()
+        cur.execute("INSERT OR REPLACE INTO settings (k, v) VALUES (?, ?)", ("persona", persona))
+        con.commit()
+    except Exception:
+        pass
+
+    return _json_utf8({
+        "ok": True,
+        "bundle_version": bundle_version,
+        "persona_saved": bool(persona),
+        "imported": imported,
+        "skipped": skipped,
+        "ts": _now()
+    })
+
+@app.get("/bundle/export")
+def bundle_export(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
+    _guard(x_auth_token)
+    rows = cur.execute("SELECT id, content, tags, ts FROM memory ORDER BY ts DESC").fetchall()
+    mem = [{
+        "id": r["id"],
+        "content": r["content"],
+        "tags": json.loads(r["tags"] or "[]"),
+        "ts": r["ts"],
+    } for r in rows]
+    persona = ""
+    try:
+        row = cur.execute("SELECT v FROM settings WHERE k='persona'").fetchone()
+        if row: persona = row[0]
+    except Exception:
+        pass
+    return _json_utf8({
+        "ok": True,
+        "bundle_version": "1.0",
+        "persona": persona,
+        "memory": mem,
+        "count": len(mem),
+        "ts": _now()
+    })
+
+@app.get("/bundle/preview")
+def bundle_preview(x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token")):
+    _guard(x_auth_token)
+    row = cur.execute("SELECT v FROM settings WHERE k='persona'").fetchone()
+    persona = row[0] if row else ""
+    latest = cur.execute("SELECT MAX(ts) FROM memory").fetchone()
+    latest_ts = latest[0] if latest and latest[0] is not None else None
+    sample = cur.execute(
+        "SELECT content FROM memory ORDER BY ts DESC LIMIT 3"
+    ).fetchall()
+    return _json_utf8({
+        "ok": True,
+        "persona": persona,
+        "count_memory": cur.execute("SELECT COUNT(*) FROM memory").fetchone()[0],
+        "latest_ts": latest_ts,
+        "sample": [s[0] for s in sample],
+        "ts": _now()
+    })
+# ============================================================================
