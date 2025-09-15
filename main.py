@@ -1,166 +1,217 @@
-# ==== UTF-8 helpers & guard (ADD TO main.py, once) ====
-import os, json, sqlite3, time, uuid
-from typing import Optional, List
-from fastapi import UploadFile, File, Header, HTTPException
+# D:\OathLink_MVP\main.py
+import os, json, time, uuid
+from typing import List, Dict, Any, Optional
+
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 
-AUTH_TOKEN = os.getenv("X_AUTH_TOKEN", "abc123")
-DB_PATH    = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "data", "oathlink.db"))
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# ─────────────────────────────────────────────────────────────────────
+# 1) 建立 FastAPI 物件（要在所有 @app.route 之前）
+# ─────────────────────────────────────────────────────────────────────
+app = FastAPI(title="wuyun-agent")
 
-# 如果 main.py 已經有全域連線，沿用既有的；否則建立一個輕量連線
-try:
-    _con  # type: ignore
-except NameError:
-    _con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    _con.row_factory = sqlite3.Row
+# ─────────────────────────────────────────────────────────────────────
+# 2) 簡單的「端上可攜記憶」記憶體存放（可改成 SQLite）
+#    以及 persona 預設（敬語版）
+# ─────────────────────────────────────────────────────────────────────
+PERSONA_KEY = "persona_name"
+STORE: Dict[str, Any] = {
+    PERSONA_KEY: "無蘊-敬語版",
+    "memory": []  # list of {id, content, tags, ts}
+}
 
-def _now() -> float:
-    return time.time()
+def now_ts() -> float:
+    return float(time.time())
 
-def _guard(x_auth_token: Optional[str]):
-    if AUTH_TOKEN and x_auth_token != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def coerce_mem(rec: Dict[str, Any]) -> Dict[str, Any]:
+    # 正規化欄位
+    return {
+        "id": rec.get("id") or str(uuid.uuid4()),
+        "content": str(rec.get("content", "")),
+        "tags": list(rec.get("tags", [])),
+        "ts": float(rec.get("ts") or now_ts())
+    }
 
-def _json_utf8(payload: dict) -> JSONResponse:
-    # 確保回傳頭帶 charset，避免 PowerShell 或代理端誤判編碼
-    return JSONResponse(payload, media_type="application/json; charset=utf-8")
+# ─────────────────────────────────────────────────────────────────────
+# 3) 基本工具：UTF-8 / UTF-8-BOM 自動解碼
+# ─────────────────────────────────────────────────────────────────────
+def decode_utf8_or_bom(b: bytes) -> str:
+    # 先試 UTF-8-SIG（可吃 BOM），失敗再退回 UTF-8
+    try:
+        return b.decode("utf-8-sig")
+    except Exception:
+        return b.decode("utf-8")
 
-# 確保表存在（與您後端 app.py 一致：content/tags/ts 皆為 UTF-8）
-_con.execute("""
-CREATE TABLE IF NOT EXISTS memory (
-    id TEXT PRIMARY KEY,
-    content TEXT NOT NULL,
-    tags TEXT NOT NULL DEFAULT '[]',
-    ts REAL NOT NULL
-)
-""")
-_con.execute("""
-CREATE TABLE IF NOT EXISTS persona (
-    id INTEGER PRIMARY KEY CHECK (id=1),
-    name TEXT,
-    system_style TEXT,
-    updated_ts REAL
-)
-""")
-_con.commit()
+# ─────────────────────────────────────────────────────────────────────
+# 4) 健康/路由
+# ─────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "wuyun-agent", "ts": now_ts()}
 
-# ==== Persona endpoints (NEW) ====
+@app.get("/routes")
+def routes():
+    return {
+        "ok": True,
+        "routes": [
+            "/health", "/routes",
+            "/compose",
+            "/bundle/export", "/bundle/preview",
+            "/bundle/import", "/bundle/import-json",
+            "/persona/get", "/persona/put"
+        ],
+        "ts": now_ts()
+    }
+
+# ─────────────────────────────────────────────────────────────────────
+# 5) compose（最小版：把 persona 與 hits 拼進去；有 OPENAI_API_KEY 再調用）
+# ─────────────────────────────────────────────────────────────────────
+@app.post("/compose")
+async def compose(req: Request):
+    """
+    Body: { input: str, top_k?: int, system_override?: str }
+    """
+    body = await req.json()
+    text: str = body.get("input", "")
+    top_k: int = int(body.get("top_k", 2))
+    system_override: Optional[str] = body.get("system_override")
+
+    # 取 hits（很簡單的 like）
+    hits = []
+    kw = text.strip()
+    if kw:
+        for r in STORE["memory"]:
+            if kw in r["content"]:
+                hits.append(r)
+            if len(hits) >= top_k:
+                break
+
+    # Persona（敬語規則）
+    persona = system_override or "稱呼願主/師父/您；回覆簡明、可執行、條列步驟；先標註風險與前置條件；不得妄稱你。"
+
+    # 若有 OPENAI_API_KEY 可在此串 OpenAI；這裡為保險先用本地模板輸出
+    output = (
+        "願主，以下為基於您輸入與可用記憶所整理之回覆：\n"
+        f"1) 已整合輸入：{text or '（空）'}\n"
+        "2) 若需雲端生成，請設定 OPENAI_API_KEY。"
+    )
+
+    prompt = {
+        "system": persona,
+        "user": f"【輸入】\n{text}\n\n【可用記憶】\n"
+                + "\n".join(f"- {h['content']}" for h in hits) if hits else "- （無匹配記憶）"
+    }
+
+    return {
+        "ok": True,
+        "prompt": prompt,
+        "context_hits": hits,
+        "output": output,
+        "model_used": "gpt-4o-mini",
+        "provider": "openai",
+        "ts": now_ts()
+    }
+
+# ─────────────────────────────────────────────────────────────────────
+# 6) persona 讀寫
+# ─────────────────────────────────────────────────────────────────────
 @app.get("/persona/get")
-def persona_get(x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    row = _con.execute("SELECT name, system_style, updated_ts FROM persona WHERE id=1").fetchone()
-    if not row:
-        return _json_utf8({"ok": True, "persona": None, "ts": _now()})
-    return _json_utf8({"ok": True, "persona": dict(row), "ts": _now()})
+def persona_get():
+    return {"ok": True, "persona": STORE.get(PERSONA_KEY, "無蘊-敬語版"), "ts": now_ts()}
 
 @app.post("/persona/put")
-def persona_put(data: dict, x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    name = data.get("name")
-    system_style = data.get("system_style")
-    if name is None and system_style is None:
-        raise HTTPException(status_code=400, detail="name or system_style required")
-    _con.execute(
-        "INSERT INTO persona(id,name,system_style,updated_ts) VALUES(1,?,?,?) "
-        "ON CONFLICT(id) DO UPDATE SET name=COALESCE(excluded.name, persona.name), "
-        "system_style=COALESCE(excluded.system_style, persona.system_style), updated_ts=?",
-        (name, system_style, _now(), _now()),
-    )
-    _con.commit()
-    return _json_utf8({"ok": True, "ts": _now()})
+async def persona_put(req: Request):
+    data = await req.json()
+    name = data.get("persona") or data.get("name")
+    if not name:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "persona is required"})
+    STORE[PERSONA_KEY] = str(name)
+    return {"ok": True, "saved": True, "persona": STORE[PERSONA_KEY], "ts": now_ts()}
 
-# ==== Bundle export/preview/import (NEW) ====
-@app.get("/bundle/export")
-def bundle_export(x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    rows = [dict(r) for r in _con.execute("SELECT id, content, tags, ts FROM memory ORDER BY ts DESC")]
-    persona_row = _con.execute("SELECT name, system_style FROM persona WHERE id=1").fetchone()
-    bundle = {
+# ─────────────────────────────────────────────────────────────────────
+# 7) bundle：export / preview / import（multipart 與 raw-json 皆可）
+#    統一資料形制：
+#    {
+#      "bundle_version":"1.0",
+#      "persona":"無蘊-敬語版",
+#      "memory":[{content,tags,ts,id?}, ...]
+#    }
+# ─────────────────────────────────────────────────────────────────────
+def bundle_dict() -> Dict[str, Any]:
+    return {
         "ok": True,
         "bundle_version": "1.0",
-        "persona": persona_row["name"] if persona_row else None,
-        "memory": rows,
-        "count": len(rows),
-        "ts": _now(),
+        "persona": STORE.get(PERSONA_KEY, "無蘊-敬語版"),
+        "memory": STORE["memory"],
+        "count": len(STORE["memory"]),
+        "ts": now_ts()
     }
-    return _json_utf8(bundle)
+
+@app.get("/bundle/export")
+def bundle_export():
+    return bundle_dict()
 
 @app.get("/bundle/preview")
-def bundle_preview(x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")):
-    _guard(x_auth_token)
-    persona_row = _con.execute("SELECT name FROM persona WHERE id=1").fetchone()
-    cnt_row = _con.execute("SELECT COUNT(*) AS c FROM memory").fetchone()
-    sample = [dict(r) for r in _con.execute("SELECT id, content, tags, ts FROM memory ORDER BY ts DESC LIMIT 5")]
-    latest = _con.execute("SELECT MAX(ts) AS m FROM memory").fetchone()
-    return _json_utf8({
+def bundle_preview():
+    mem = STORE["memory"]
+    sample = mem[:5]
+    latest_ts = max((m["ts"] for m in mem), default=0.0)
+    return {
         "ok": True,
-        "persona": persona_row["name"] if persona_row else None,
-        "count_memory": cnt_row["c"],
-        "latest_ts": latest["m"],
+        "persona": STORE.get(PERSONA_KEY, "無蘊-敬語版"),
+        "count_memory": len(mem),
+        "latest_ts": latest_ts,
         "sample": sample
-    })
+    }
 
-# 1) multipart 版本：PowerShell/.NET HttpClient 上傳檔案用
 @app.post("/bundle/import")
-async def bundle_import_file(
-    file: UploadFile = File(...),
-    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")
-):
-    _guard(x_auth_token)
+async def bundle_import(file: UploadFile = File(...)):
+    # 接受 multipart/form-data 的檔案欄位名 "file"
     raw = await file.read()
-    # 防 BOM：utf-8-sig 會自動剝除 BOM；無 BOM 也可正常解
-    text = raw.decode("utf-8-sig")
-    data = json.loads(text)
-    return _bundle_import_core(data)
+    text = decode_utf8_or_bom(raw)
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"detail": f"Invalid JSON: {e}"})
+    return _bundle_apply(data)
 
-# 2) application/json 版本：直接 POST JSON 用
 @app.post("/bundle/import-json")
-def bundle_import_json(
-    data: dict,
-    x_auth_token: Optional[str] = Header(None, alias="X-Auth-Token")
-):
-    _guard(x_auth_token)
-    return _bundle_import_core(data)
+async def bundle_import_json(req: Request):
+    # 接受 Content-Type: application/json 直接 body
+    raw = await req.body()
+    text = decode_utf8_or_bom(raw)
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"detail": f"Invalid JSON: {e}"})
+    return _bundle_apply(data)
 
-def _bundle_import_core(data: dict) -> JSONResponse:
-    # 接受 {"bundle_version":"1.0","persona": "...", "memory":[...]}
+def _bundle_apply(data: Dict[str, Any]):
+    # persona
     persona = data.get("persona")
-    mem_list = data.get("memory", [])
-    imported, skipped = 0, 0
+    if isinstance(persona, str) and persona.strip():
+        STORE[PERSONA_KEY] = persona.strip()
 
-    # persona 可選
-    if persona:
-        _con.execute(
-            "INSERT INTO persona(id,name,system_style,updated_ts) VALUES(1,?,NULL,?) "
-            "ON CONFLICT(id) DO UPDATE SET name=excluded.name, updated_ts=excluded.updated_ts",
-            (persona, _now()),
-        )
+    # memory
+    imported = 0
+    for rec in data.get("memory", []):
+        m = coerce_mem(rec)
+        # 以 id 去重；若沒有 id 就直接新增
+        exists = next((x for x in STORE["memory"] if x["id"] == m["id"]), None)
+        if exists:
+            # 若內容一樣就跳過
+            if exists["content"] == m["content"] and exists["tags"] == m["tags"]:
+                continue
+            # 否則覆蓋（或您可改成保留舊的）
+            exists.update(m)
+        else:
+            STORE["memory"].append(m)
+            imported += 1
 
-    for m in mem_list:
-        mid = m.get("id") or str(uuid.uuid4())
-        content = m.get("content", "")
-        tags = m.get("tags", [])
-        ts = float(m.get("ts", _now()))
-        try:
-            _con.execute(
-                "INSERT OR IGNORE INTO memory(id, content, tags, ts) VALUES(?,?,?,?)",
-                (mid, content, json.dumps(tags, ensure_ascii=False), ts),
-            )
-            if _con.total_changes:
-                imported += 1
-            else:
-                skipped += 1
-        except sqlite3.IntegrityError:
-            skipped += 1
-
-    _con.commit()
-    return _json_utf8({
+    return {
         "ok": True,
         "bundle_version": "1.0",
-        "persona_saved": bool(persona),
+        "persona_saved": True,
         "imported": imported,
-        "skipped": skipped,
-        "ts": _now(),
-    })
-# ==== end new endpoints ====
+        "ts": now_ts()
+    }
