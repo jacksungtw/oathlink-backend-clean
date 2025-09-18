@@ -1,4 +1,4 @@
-@'
+
 # main_bridge_utf8.py — OathLink 橋接器（強制 UTF-8 回傳）
 import os, json, time
 from pathlib import Path
