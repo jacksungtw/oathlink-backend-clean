@@ -1,273 +1,376 @@
-# app_final.py — OathLink 最終整合版（UTF-8 安全 /compose + 記憶 + bundle + reset）
-# ----------------------------------------------------------------------------
-# 功能摘要
-# - UTF-8 鎖定：所有檔案以 UTF-8 讀寫、回傳 JSON 皆帶 charset=utf-8
-# - 路由：/health /routes /compose /memory/write /memory/search
-#         /debug/reset /debug/peek
-#         /bundle/export /bundle/import /bundle/preview /bundle/reset
-# - 記憶存放：data/memory.json（UTF-8）
-# - Persona/Glossary：data/bundle.json（UTF-8）
-# - 權杖：若環境變數 AUTH_TOKEN 存在，要求 Header: X-Auth-Token
-# - 模型：預設本地模板，之後可於 call_model() 接 OpenAI/Ollama 等
-# ----------------------------------------------------------------------------
+# app_final.py  —  UTF-8 safe + no orjson dependency
+import os
+import json
+import time
+import sqlite3
+from typing import List, Optional, Dict, Any
 
-from __future__ import annotations
-import os, json, time, uuid, re, traceback
-from pathlib import Path
-from typing import Dict, Any, List
-
-from fastapi import FastAPI, Body, Query, Header, HTTPException
+from fastapi import FastAPI, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from starlette.responses import Response
 
-APP_NAME   = "oathlink-backend"
-BASE_DIR   = Path(__file__).parent.resolve()
-DATA_DIR   = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# -----------------------------------------------------------------------------
+# 基本設定
+# -----------------------------------------------------------------------------
+DB_PATH = os.getenv("OATHLINK_DB", "oathlink.db")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "abc123")  # 若不想驗證可設為空字串 ""
 
-MEM_PATH   = DATA_DIR / "memory.json"
-BUNDLE_PATH= DATA_DIR / "bundle.json"
-
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
-
-# -------------------------- 工具：UTF-8 JSON 回傳 --------------------------
-def j(obj: Any, status: int = 200) -> JSONResponse:
-    # content 必須是 Python 物件，避免二次編碼
-    return JSONResponse(content=obj, status_code=status, media_type="application/json; charset=utf-8")
-
-def require_auth(x_auth_token: str | None):
-    if AUTH_TOKEN and (x_auth_token or "") != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# -------------------------- 檔案 I/O（UTF-8） --------------------------
-def read_json(path: Path, default):
-    if not path.exists():
-        path.write_text(json.dumps(default, ensure_ascii=False, indent=2), encoding="utf-8")
-        return default
-    return json.loads(path.read_text(encoding="utf-8"))
-
-def write_json(path: Path, obj):
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-# -------------------------- 預設資料 --------------------------
-DEFAULT_BUNDLE: Dict[str, Any] = {
-    "bundle_version": "1.0",
-    "persona": {
-        "id": "wuyun-keigo",
-        "name": "無蘊-敬語版",
-        "system_style": "稱呼願主/師父/您；簡明條列；先列風險與前置條件；不得妄稱你。"
-    },
-    "glossary": [
-        {"term":"你","preferred":"您","notes":"全程敬語"},
-        {"term":"妳","preferred":"您","notes":"全程敬語"}
-    ],
-    "memory": []
+PERSONA_DEFAULT = {
+    "id": "wuyun-keigo",
+    "name": "無蘊-敬語版",
+    "system_style": "稱呼願主/師父/您；簡明條列；先列風險與前置條件；不得妄稱你。"
 }
+GLOSSARY_DEFAULT = [
+    {"term": "你", "preferred": "您", "notes": "全程敬語"},
+    {"term": "妳", "preferred": "您", "notes": "全程敬語"},
+]
 
-def load_bundle() -> Dict[str, Any]:
-    return read_json(BUNDLE_PATH, DEFAULT_BUNDLE)
+# -----------------------------------------------------------------------------
+# App & 中介層
+# -----------------------------------------------------------------------------
+app = FastAPI(title="oathlink-backend", version="1.0.0")
 
-def save_bundle(b: Dict[str, Any]):
-    write_json(BUNDLE_PATH, b)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
-def load_memory() -> List[Dict[str, Any]]:
-    return read_json(MEM_PATH, [])
+def j(data: Dict[str, Any], status_code: int = 200) -> Response:
+    """以 UTF-8 回傳 JSON，中文不轉義。"""
+    return Response(
+        content=json.dumps(data, ensure_ascii=False),
+        status_code=status_code,
+        media_type="application/json; charset=utf-8",
+    )
 
-def save_memory(rows: List[Dict[str, Any]]):
-    write_json(MEM_PATH, rows)
+# -----------------------------------------------------------------------------
+# 資料庫
+# -----------------------------------------------------------------------------
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # 預設即 UTF-8，無需改 text_factory
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            ts REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
 
-# -------------------------- 記憶檢索（LIKE） --------------------------
-TOKEN_PAT = re.compile(r"[\u4e00-\u9fff\w]+")
+CONN = get_conn()
 
-def search_memory(q: str, rows: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
-    if not q:
-        return []
-    q_tokens = set(TOKEN_PAT.findall(q))
-    scored = []
-    for m in rows:
-        content = m.get("content","")
-        tokens = set(TOKEN_PAT.findall(content))
-        score = len(q_tokens & tokens)
-        if q in content:
-            score += 2
-        if score > 0:
-            scored.append((score, m))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [m for _, m in scored[:top_k]]
+def meta_set(key: str, value: Any):
+    CONN.execute(
+        "INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (key, json.dumps(value, ensure_ascii=False))
+    )
+    CONN.commit()
 
-# -------------------------- 模型呼叫（可擴充） --------------------------
-def call_model(system: str, user_text: str, params: Dict[str, Any] | None = None) -> str:
-    # 預設本地模板，不外呼
-    return (
+def meta_get(key: str, default: Any):
+    cur = CONN.execute("SELECT v FROM meta WHERE k=?", (key,))
+    row = cur.fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return default
+
+# 初始化 persona / glossary（若尚未設定）
+if meta_get("persona", None) is None:
+    meta_set("persona", PERSONA_DEFAULT)
+if meta_get("glossary", None) is None:
+    meta_set("glossary", GLOSSARY_DEFAULT)
+
+# -----------------------------------------------------------------------------
+# 驗證
+# -----------------------------------------------------------------------------
+def check_auth(x_auth_token: Optional[str]) -> Optional[Response]:
+    """若設定了 AUTH_TOKEN，則要求 Header 相符；否則略過。"""
+    if AUTH_TOKEN and (x_auth_token or "") != AUTH_TOKEN:
+        return j({"ok": False, "error": "unauthorized"}, 401)
+    return None
+
+# -----------------------------------------------------------------------------
+# 工具
+# -----------------------------------------------------------------------------
+def new_uuid() -> str:
+    import uuid
+    return str(uuid.uuid4())
+
+def now_ts() -> float:
+    return time.time()
+
+# -----------------------------------------------------------------------------
+# 路由
+# -----------------------------------------------------------------------------
+from pydantic import BaseModel
+
+class MemoryDeleteIn(BaseModel):
+    id: str
+
+@app.post("/memory/delete")
+def memory_delete(inp: MemoryDeleteIn, req: Request):
+    if not check_auth(req):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    with CONN:
+        cur = CONN.execute("DELETE FROM memory WHERE id=?", (inp.id,))
+        deleted = cur.rowcount if hasattr(cur, "rowcount") else 0
+    return {"ok": True, "deleted": int(deleted)}
+
+@app.get("/health")
+def health():
+    return j({"ok": True, "service": "oathlink-backend", "ts": now_ts()})
+
+@app.get("/routes")
+def routes():
+    return j({
+        "ok": True,
+        "routes": [
+            "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
+            "/health", "/routes",
+            "/debug/reset", "/debug/peek",
+            "/memory/write", "/memory/search",
+            "/compose",
+            "/bundle/export", "/bundle/preview", "/bundle/import", "/bundle/reset",
+        ],
+        "ts": now_ts()
+    })
+
+# --------------------- Debug ---------------------
+@app.post("/debug/reset")
+def debug_reset(x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
+
+    CONN.execute("DELETE FROM memory")
+    meta_set("persona", PERSONA_DEFAULT)
+    meta_set("glossary", GLOSSARY_DEFAULT)
+    return j({"ok": True, "reset": True, "ts": now_ts()})
+
+@app.get("/debug/peek")
+def debug_peek(x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
+
+    cur = CONN.execute("SELECT id,content,tags,ts FROM memory ORDER BY ts DESC")
+    rows = []
+    for rid, content, tags, ts_ in cur.fetchall():
+        try:
+            tags_list = json.loads(tags)
+        except Exception:
+            tags_list = []
+        rows.append({"id": rid, "content": content, "tags": tags_list, "ts": ts_})
+    return j({"ok": True, "rows": rows, "ts": now_ts()})
+
+# --------------------- Memory ---------------------
+@app.post("/memory/write")
+async def memory_write(req: Request, x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
+
+    payload = await req.json()
+    content = str(payload.get("content", "")).strip()
+    tags = payload.get("tags", [])
+    if not isinstance(tags, list):
+        tags = []
+
+    if not content:
+        return j({"ok": False, "error": "content is empty"}, 400)
+
+    rid = new_uuid()
+    CONN.execute(
+        "INSERT INTO memory(id, content, tags, ts) VALUES(?,?,?,?)",
+        (rid, content, json.dumps(tags, ensure_ascii=False), now_ts())
+    )
+    CONN.commit()
+    return j({"ok": True, "id": rid})
+
+@app.get("/memory/search")
+def memory_search(q: Optional[str] = None, top_k: int = 5,
+                  x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
+
+    q = (q or "").strip()
+    results = []
+    if q:
+        cur = CONN.execute(
+            "SELECT id,content,tags,ts FROM memory WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
+            (f"%{q}%", top_k)
+        )
+        for rid, content, tags, ts_ in cur.fetchall():
+            try:
+                tags_list = json.loads(tags)
+            except Exception:
+                tags_list = []
+            results.append({"id": rid, "content": content, "tags": tags_list, "ts": ts_})
+    return j({"ok": True, "results": results, "ts": now_ts()})
+
+# --------------------- Compose ---------------------
+@app.post("/compose")
+async def compose(req: Request, x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
+
+    payload = await req.json()
+    input_text = str(payload.get("input", payload.get("text", "")))
+    tags = payload.get("tags", [])
+    top_k = int(payload.get("top_k", 5) or 5)
+
+    persona = meta_get("persona", PERSONA_DEFAULT)
+
+    # 取記憶 hits（LIKE 模式：用 input 的前 20 字當關鍵）
+    needle = input_text[:20]
+    hits = []
+    if needle.strip():
+        cur = CONN.execute(
+            "SELECT id,content,tags,ts FROM memory WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
+            (f"%{needle}%", top_k)
+        )
+        for rid, content, tags_, ts_ in cur.fetchall():
+            try:
+                tags_list = json.loads(tags_)
+            except Exception:
+                tags_list = []
+            hits.append({"id": rid, "content": content, "tags": tags_list, "ts": ts_})
+
+    # 組 prompt（顯示用）
+    if hits:
+        ctx = "\n".join([f"- {h['content']}" for h in hits])
+    else:
+        ctx = "（無匹配記憶）"
+
+    prompt = {
+        "system": persona["system_style"],
+        "user": f"【輸入】\n{input_text}\n\n【可用記憶】\n{ctx}\n\n請以固定語風輸出最終回覆。"
+    }
+
+    # 這裡示範本地拼接（未呼叫外部模型）
+    output = (
         "願主，以下為基於您輸入與可用記憶所整理之回覆（本地拼接，未呼叫外部模型）：\n"
         "1) 已整合輸入與歷史記憶。\n"
         "2) 若需更精煉文本，請設定 OPENAI_API_KEY 以啟用雲端生成。"
     )
 
-# -------------------------- FastAPI App --------------------------
-app = FastAPI(title=APP_NAME, version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-@app.get("/health")
-def health():
-    return j({"ok": True, "service": APP_NAME, "ts": time.time()})
-
-@app.get("/routes")
-def routes():
-    return j({"ok": True, "routes": [r.path for r in app.routes], "ts": time.time()})
-
-# -------------------------- Debug / Reset --------------------------
-@app.post("/debug/reset")
-def debug_reset(x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")):
-    require_auth(x_auth_token)
-    save_memory([])
-    save_bundle(DEFAULT_BUNDLE)
-    return j({"ok": True, "reset": True, "ts": time.time()})
-
-@app.get("/debug/peek")
-def debug_peek(x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")):
-    require_auth(x_auth_token)
-    rows = load_memory()
-    rows_sorted = sorted(rows, key=lambda m: m.get("ts", 0), reverse=True)
-    return j({"ok": True, "rows": rows_sorted[:50], "ts": time.time()})
-
-# -------------------------- 記憶 API --------------------------
-@app.post("/memory/write")
-def memory_write(
-    body: Dict[str, Any] = Body(..., example={"content":"中文編碼測試","tags":["clean"]}),
-    x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")
-):
-    require_auth(x_auth_token)
-    content = (body or {}).get("content", "")
-    tags    = (body or {}).get("tags", [])
-    if not isinstance(tags, list): tags = []
-    row = {"id": str(uuid.uuid4()), "content": content, "tags": tags, "ts": time.time()}
-    rows = load_memory()
-    rows.append(row)
-    save_memory(rows)
-    return j({"ok": True, "id": row["id"]})
-
-@app.get("/memory/search")
-def memory_search_api(
-    q: str, top_k: int = Query(5, ge=1, le=50),
-    x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")
-):
-    require_auth(x_auth_token)
-    rows = load_memory()
-    results = search_memory(q, rows, top_k=top_k)
-    return j({"ok": True, "results": results, "ts": time.time()})
-
-# -------------------------- Compose --------------------------
-@app.post("/compose")
-def compose(
-    body: Dict[str, Any] = Body(..., example={"input":"即時測試","tags":["clean","demo"],"top_k":5}),
-    x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")
-):
-    require_auth(x_auth_token)
-    try:
-        input_text = body.get("input") or body.get("text") or ""
-        tags       = body.get("tags") or []
-        top_k      = int(body.get("top_k") or 5)
-
-        bundle     = load_bundle()
-        persona    = (bundle.get("persona") or {}).get("system_style", "")
-        rows       = load_memory()
-        hits       = search_memory(input_text, rows, top_k=top_k)
-
-        system = f"您是『OathLink 穩定語風人格助手（無蘊）』。規範：稱使用者為願主/師父/您；回覆簡明、可執行、條列步驟；不說空話；必要時先標註風險與前置條件。"
-        if persona:
-            system = persona if isinstance(persona, str) else str(persona)
-
-        mem_ctx = "- " + "\n- ".join([h.get("content","") for h in hits]) if hits else "（無匹配記憶）"
-        prompt = {
-            "system": system,
-            "user":   f"【輸入】\n{input_text}\n\n【可用記憶】\n{mem_ctx}\n\n請以固定語風輸出最終回覆。"
-        }
-
-        output = call_model(system, input_text, params={})
-        return j({
-            "ok": True,
-            "prompt": prompt,
-            "context_hits": hits,
-            "output": output,
-            "model_used": "gpt-4o-mini",
-            "search_mode": "like",
-            "ts": time.time()
-        })
-    except Exception as e:
-        return j({"ok": False, "error": str(e), "trace": traceback.format_exc()}, status=500)
-
-# -------------------------- Bundle APIs --------------------------
-@app.get("/bundle/export")
-def bundle_export():
-    return j(load_bundle())
-
-@app.get("/bundle/preview")
-def bundle_preview():
-    b = load_bundle()
     return j({
         "ok": True,
-        "persona": b.get("persona", {}),
-        "memory_count": len(b.get("memory", [])),
-        "glossary_count": len(b.get("glossary", [])),
-        "memory_sample": b.get("memory", [])[:5],
-        "ts": time.time()
+        "prompt": prompt,
+        "context_hits": hits,
+        "output": output,
+        "model_used": "gpt-4o-mini",
+        "search_mode": "like",
+        "ts": now_ts()
     })
 
+# --------------------- Bundle ---------------------
+@app.get("/bundle/export")
+def bundle_export(x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
+
+    persona = meta_get("persona", PERSONA_DEFAULT)
+    glossary = meta_get("glossary", GLOSSARY_DEFAULT)
+
+    # 匯出時不把所有 memory 帶出（依您需求可更動：這裡保留空）
+    return j({
+        "bundle_version": "1.0",
+        "persona": persona,
+        "memory": [],
+        "glossary": glossary,
+    })
+
+@app.get("/bundle/preview")
+def bundle_preview(x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
+
+    persona = meta_get("persona", PERSONA_DEFAULT)
+    glossary = meta_get("glossary", GLOSSARY_DEFAULT)
+
+    cur = CONN.execute("SELECT id,content,tags,ts FROM memory ORDER BY ts DESC LIMIT 5")
+    sample = []
+    for rid, content, tags, ts_ in cur.fetchall():
+        try:
+            tags_list = json.loads(tags)
+        except Exception:
+            tags_list = []
+        sample.append({"id": rid, "content": content, "tags": tags_list, "ts": ts_})
+    return j({
+        "ok": True,
+        "persona": persona,
+        "memory_count": _count_memory(),
+        "glossary_count": len(glossary),
+        "memory_sample": sample,
+        "ts": now_ts()
+    })
+
+def _count_memory() -> int:
+    cur = CONN.execute("SELECT COUNT(1) FROM memory")
+    return int(cur.fetchone()[0])
+
 @app.post("/bundle/import")
-def bundle_import(body: Dict[str, Any] = Body(...), x_auth_token: str | None = Header(default=None, alias="X-Auth-Token")):
-    require_auth(x_auth_token)
-    mode = (body.get("mode") or "merge").lower()
-    persona = body.get("persona")
-    memory  = body.get("memory")
-    glossary= body.get("glossary")
+async def bundle_import(req: Request, x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
 
-    cur = load_bundle()
+    payload = await req.json()
+    mode = payload.get("mode", "replace")
 
-    if mode == "replace":
-        newb = {
-            "bundle_version": cur.get("bundle_version","1.0"),
-            "persona": persona if persona is not None else cur.get("persona", {}),
-            "memory":  memory  if memory  is not None else [],
-            "glossary":glossary if glossary is not None else []
-        }
-        save_bundle(newb)
-        return j({"ok": True, "mode": "replace", "ts": time.time()})
+    persona = payload.get("persona")
+    glossary = payload.get("glossary")
+    memory = payload.get("memory", [])
 
-    # merge
-    if persona is not None:
-        cur["persona"] = persona
+    if mode not in ("replace", "merge"):
+        return j({"ok": False, "error": "mode must be 'replace' or 'merge'"}, 400)
 
+    if persona:
+        if mode == "replace":
+            meta_set("persona", persona)
+        else:
+            old = meta_get("persona", {})
+            old.update(persona or {})
+            meta_set("persona", old)
+
+    if glossary:
+        if mode == "replace":
+            meta_set("glossary", glossary)
+        else:
+            old = meta_get("glossary", [])
+            # 簡單合併：直接接在後面（若需去重可再強化）
+            meta_set("glossary", old + glossary)
+
+    # 可選：匯入記憶
     if isinstance(memory, list):
-        # 追加；若有 id 相同，覆蓋
-        idx = {m.get("id"): i for i,m in enumerate(cur.get("memory", [])) if isinstance(m, dict) and m.get("id")}
         for m in memory:
-            if not isinstance(m, dict): continue
-            mid = m.get("id") or str(uuid.uuid4())
-            m.setdefault("id", mid)
-            m.setdefault("ts", time.time())
-            if mid in idx:
-                cur["memory"][idx[mid]] = m
-            else:
-                cur["memory"].append(m)
+            content = str(m.get("content", "")).strip()
+            tags = m.get("tags", [])
+            if not content:
+                continue
+            rid = new_uuid()
+            CONN.execute(
+                "INSERT INTO memory(id, content, tags, ts) VALUES(?,?,?,?)",
+                (rid, content, json.dumps(tags, ensure_ascii=False), now_ts())
+            )
+        CONN.commit()
 
-    if isinstance(glossary, list):
-        cur["glossary"] = glossary
-
-    save_bundle(cur)
-    return j({"ok": True, "mode": "merge", "ts": time.time()})
+    return j({"ok": True, "mode": mode, "ts": now_ts()})
 
 @app.post("/bundle/reset")
-def bundle_reset(keep_memory: bool = Query(False, description="是否保留現有記憶")):
-    cur = load_bundle()
-    newb = DEFAULT_BUNDLE.copy()
-    if keep_memory:
-        newb["memory"] = cur.get("memory", [])
-    save_bundle(newb)
-    return j({"ok": True, "reset": True, "kept_memory": keep_memory, "persona": newb["persona"], "ts": time.time()})
+def bundle_reset(x_auth_token: Optional[str] = Header(None)):
+    unauthorized = check_auth(x_auth_token)
+    if unauthorized: return unauthorized
 
-# -------------------------- 入口 --------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app_final:app", host="127.0.0.1", port=port, reload=False)
+    meta_set("persona", PERSONA_DEFAULT)
+    meta_set("glossary", GLOSSARY_DEFAULT)
+    return j({"ok": True, "ts": now_ts()})
